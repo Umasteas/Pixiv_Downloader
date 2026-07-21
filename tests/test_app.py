@@ -114,6 +114,19 @@ def test_start_app_restores_saved_token_before_serving(monkeypatch):
     assert stub.get_access_token_calls == 1
 
 
+def test_app_initializes_history_database_and_required_tables():
+    from src.pixiv_downloader.database import DatabaseManager
+
+    assert isinstance(app_module.database_manager, DatabaseManager)
+    tables = {
+        row[0]
+        for row in app_module.database_manager.connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    assert {"tasks", "downloads", "followed_artists"}.issubset(tables)
+
+
 def test_first_start_page_shows_welcome_and_token_setup_steps(monkeypatch):
     stub = StubAuthManager(configured=False)
     monkeypatch.setattr(app_module, "auth_manager", stub)

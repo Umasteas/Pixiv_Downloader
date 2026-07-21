@@ -2,10 +2,12 @@
 import webbrowser
 import secrets
 import copy
+import atexit
 from flask import Flask, render_template, jsonify, request
 from flask_socketio import SocketIO
 from .auth import AuthError, AuthManager
 from .config_manager import ConfigManager
+from .database import DatabaseManager
 
 app = Flask(__name__, 
             template_folder='../../templates',
@@ -15,6 +17,8 @@ app.config['SECRET_KEY'] = secrets.token_hex(16)
 socketio = SocketIO(app, cors_allowed_origins="*")
 config_manager = ConfigManager()
 auth_manager = AuthManager(config_manager)
+database_manager = DatabaseManager()
+atexit.register(database_manager.close)
 
 # 生成随机 token 用于 URL
 SECURITY_TOKEN = secrets.token_urlsafe(16)
