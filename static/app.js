@@ -157,3 +157,38 @@ if (proxyForm && proxyTest) {
         })
         .catch((error) => showProxyFeedback('danger', `代理配置加载失败：${error.message}`));
 }
+
+const artistDownloadForm = document.getElementById('artist-download-form');
+
+if (artistDownloadForm) {
+    const artistIdInput = document.getElementById('artist-id');
+    const submitButton = document.getElementById('artist-download-submit');
+    const feedback = document.getElementById('artist-download-feedback');
+
+    artistDownloadForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        submitButton.disabled = true;
+        feedback.className = 'alert alert-info mt-3';
+        feedback.textContent = '正在获取画师作品并下载，请稍候…';
+
+        try {
+            const response = await fetch('/api/download/artist', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ artist_id: Number(artistIdInput.value) }),
+            });
+            const payload = await response.json();
+            if (!response.ok) {
+                throw new Error(payload.error || '画师作品下载失败。');
+            }
+            const result = payload.result;
+            feedback.className = `alert alert-${result.failed ? 'warning' : 'success'} mt-3`;
+            feedback.textContent = `处理 ${result.total} 个作品：下载 ${result.downloaded}，跳过 ${result.skipped}，失败 ${result.failed}。`;
+        } catch (error) {
+            feedback.className = 'alert alert-danger mt-3';
+            feedback.textContent = error.message;
+        } finally {
+            submitButton.disabled = false;
+        }
+    });
+}

@@ -4,11 +4,13 @@ import webbrowser
 import secrets
 import copy
 import atexit
+from pathlib import Path
 from flask import Flask, render_template, jsonify, request
 from flask_socketio import SocketIO
 from .auth import AuthError, AuthManager
 from .config_manager import ConfigManager
 from .database import DatabaseManager
+from .downloader import ArtistDownloader
 from .proxy import ProxyConfigError, ProxyManager
 from .runtime import runtime_paths
 
@@ -148,6 +150,47 @@ def test_proxy():
     success, message = asyncio.run(proxy_manager.test_connection(data))
     status = 200 if success else 502
     return jsonify({"success": success, "message": message}), status
+
+
+@app.route('/api/download/artist', methods=['POST'])
+def download_artist():
+    """下载指定画师的单图作品。"""
+    data = request.get_json(silent=True)
+    raw_artist_id = data.get("artist_id") if isinstance(data, dict) else None
+    if type(raw_artist_id) is not int or raw_artist_id <= 0:
+        return jsonify({"success": False, "error": "画师 ID 必须是正整数"}), 400
+    artist_id = raw_artist_id
+
+    try:
+        auth_manager.get_access_token()
+        if auth_manager.api is None:
+            raise AuthError("Pixiv 登录状态不可用")
+        configured_output = Path(
+            config_manager.get_setting("download", "output_dir", "./downloads")
+        )
+        output_dir = (
+            configured_output
+            if configured_output.is_absolute()
+            else RUNTIME_PATHS.application_dir / configured_output
+        )
+        downloader = ArtistDownloader(
+            auth_manager.api,
+            database_manager,
+            proxy_manager,
+            output_dir=output_dir.resolve(),
+        )
+        result = asyncio.run(downloader.download_artist(artist_id))
+    except AuthError:
+        return jsonify({
+            "success": False,
+            "error": "Pixiv 登录失败，请重新配置 Token。",
+        }), 401
+    except Exception:
+        return jsonify({
+            "success": False,
+            "error": "画师作品下载失败，请检查网络、代理和磁盘空间。",
+        }), 500
+    return jsonify({"success": True, "result": result})
 
 
 @app.route('/api/tasks', methods=['GET'])

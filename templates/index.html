@@ -58,13 +58,31 @@
                     </div>
                 </div>
             </div>
+            <div class="col-12 mt-4">
+                <div class="card">
+                    <div class="card-body">
+                        <h2 class="h4">按画师下载单图作品</h2>
+                        <p class="text-muted">输入 Pixiv 画师 ID；当前版本只下载单图作品，多图作品会自动跳过。</p>
+                        <form id="artist-download-form" class="row g-3 align-items-end">
+                            <div class="col-md-8">
+                                <label for="artist-id" class="form-label">画师 ID</label>
+                                <input id="artist-id" class="form-control" type="number" min="1" required inputmode="numeric">
+                            </div>
+                            <div class="col-md-4">
+                                <button id="artist-download-submit" class="btn btn-primary w-100" type="submit">开始下载</button>
+                            </div>
+                        </form>
+                        <div id="artist-download-feedback" class="alert mt-3 d-none" role="alert"></div>
+                    </div>
+                </div>
+            </div>
         </div>
         {% endif %}
 
         <section id="proxy-settings" class="card mt-4">
             <div class="card-body">
                 <h2 class="h4">代理设置</h2>
-                <p class="text-muted">Pixiv API 与连接测试使用同一代理；后续下载模块将复用这套网络配置。</p>
+                <p class="text-muted">Pixiv API、图片下载与连接测试使用同一代理。</p>
                 <form id="proxy-form">
                     <fieldset class="mb-3">
                         <legend class="form-label fs-6">代理类型</legend>
