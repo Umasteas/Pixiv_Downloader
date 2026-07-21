@@ -25,6 +25,7 @@ atexit.register(database_manager.close)
 
 # 生成随机 token 用于 URL
 SECURITY_TOKEN = secrets.token_urlsafe(16)
+startup_connectivity = None
 
 @app.route('/')
 def index():
@@ -33,7 +34,9 @@ def index():
     if token != SECURITY_TOKEN:
         return "Unauthorized", 403
     return render_template(
-        'index.html', needs_setup=not auth_manager.has_saved_token()
+        'index.html',
+        needs_setup=not auth_manager.has_saved_token(),
+        startup_connectivity=startup_connectivity,
     )
 
 @app.route('/api/auth/status', methods=['GET'])
@@ -62,8 +65,12 @@ def get_config():
     # 隐藏敏感信息，同时避免把掩码写回内存中的真实配置。
     if 'pixiv' in config and 'refresh_token' in config['pixiv']:
         config['pixiv']['refresh_token'] = '***' if config['pixiv']['refresh_token'] else ''
-    if 'proxy' in config and config['proxy'].get('password'):
-        config['proxy']['password'] = '***'
+    if 'proxy' in config:
+        encrypted_password = config['proxy'].pop('password_encrypted', '')
+        legacy_password = config['proxy'].pop('password', '')
+        config['proxy']['password'] = (
+            '***' if encrypted_password or legacy_password else ''
+        )
     return jsonify(config)
 
 @app.route('/api/config', methods=['POST'])
@@ -126,8 +133,14 @@ def update_proxy():
 
 @app.route('/api/proxy/test', methods=['POST'])
 def test_proxy():
-    """使用当前设置探测 Pixiv 可达性。"""
-    success, message = asyncio.run(proxy_manager.test_connection())
+    """使用候选设置探测 Pixiv，可用性测试不会改写配置。"""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({
+            "success": False,
+            "message": "代理配置必须是 JSON 对象",
+        }), 400
+    success, message = asyncio.run(proxy_manager.test_connection(data))
     status = 200 if success else 502
     return jsonify({"success": success, "message": message}), status
 
@@ -157,11 +170,16 @@ def handle_disconnect():
 
 def start_app(host='127.0.0.1', port=5000, auto_open=True):
     """启动应用"""
+    global startup_connectivity
     url = f'http://{host}:{port}?token={SECURITY_TOKEN}'
     print(f'Starting Pixiv Downloader...')
     print(f'Access URL: {url}')
 
     reachable, connectivity_message = asyncio.run(proxy_manager.test_connection())
+    startup_connectivity = {
+        "reachable": reachable,
+        "message": connectivity_message,
+    }
     print(connectivity_message)
     if not reachable:
         print('Pixiv 当前不可达，请在设置页面配置代理后重试。')

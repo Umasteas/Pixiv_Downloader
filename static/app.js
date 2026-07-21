@@ -59,6 +59,7 @@ if (proxyForm && proxyTest) {
     const port = document.getElementById('proxy-port');
     const username = document.getElementById('proxy-username');
     const password = document.getElementById('proxy-password');
+    const clearPassword = document.getElementById('proxy-clear-password');
     let savedPasswordPresent = false;
 
     const selectedType = () => proxyForm.querySelector('input[name="proxy-type"]:checked').value;
@@ -76,13 +77,20 @@ if (proxyForm && proxyTest) {
         details.classList.toggle('opacity-50', !needsDetails);
     };
 
-    const proxyPayload = () => ({
-        type: selectedType(),
-        host: host.value.trim(),
-        port: port.value,
-        username: username.value,
-        password: password.value || (savedPasswordPresent ? '***' : ''),
-    });
+    const proxyPayload = () => {
+        const type = selectedType();
+        if (['none', 'system'].includes(type)) {
+            return { type, clear_password: true };
+        }
+        return {
+            type,
+            host: host.value.trim(),
+            port: port.value,
+            username: username.value,
+            password: password.value || (savedPasswordPresent ? '***' : ''),
+            clear_password: clearPassword.checked,
+        };
+    };
 
     const saveProxy = async () => {
         const response = await fetch('/api/proxy', {
@@ -96,6 +104,7 @@ if (proxyForm && proxyTest) {
         }
         savedPasswordPresent = result.proxy.password === '***';
         password.value = '';
+        clearPassword.checked = false;
         return result;
     };
 
@@ -117,8 +126,11 @@ if (proxyForm && proxyTest) {
         proxyTest.disabled = true;
         showProxyFeedback('info', '正在测试 Pixiv 连接…');
         try {
-            await saveProxy();
-            const response = await fetch('/api/proxy/test', { method: 'POST' });
+            const response = await fetch('/api/proxy/test', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(proxyPayload()),
+            });
             const result = await response.json();
             if (!response.ok) {
                 throw new Error(result.message || '代理连接测试失败。');
@@ -140,6 +152,7 @@ if (proxyForm && proxyTest) {
             port.value = proxy.port || '';
             username.value = proxy.username || '';
             savedPasswordPresent = proxy.password === '***';
+            clearPassword.checked = false;
             updateProxyDetails();
         })
         .catch((error) => showProxyFeedback('danger', `代理配置加载失败：${error.message}`));

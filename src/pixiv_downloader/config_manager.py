@@ -29,7 +29,7 @@ DEFAULT_CONFIG = {
         "host": "127.0.0.1",
         "port": 1080,
         "username": "",
-        "password": ""
+        "password_encrypted": ""
     },
     "logging": {
         "level": "INFO",

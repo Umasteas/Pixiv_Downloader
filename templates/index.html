@@ -15,6 +15,11 @@
     </nav>
 
     <div class="container mt-4">
+        {% if startup_connectivity and not startup_connectivity.reachable %}
+        <div id="startup-proxy-alert" class="alert alert-warning" role="alert">
+            {{ startup_connectivity.message }} 请在下方检查或配置代理。
+        </div>
+        {% endif %}
         {% if needs_setup %}
         <div id="setup-wizard" class="row g-4">
             <div class="col-lg-5">
@@ -59,7 +64,7 @@
         <section id="proxy-settings" class="card mt-4">
             <div class="card-body">
                 <h2 class="h4">代理设置</h2>
-                <p class="text-muted">配置后，Pixiv API 与图片下载请求都会使用同一代理。</p>
+                <p class="text-muted">Pixiv API 与连接测试使用同一代理；后续下载模块将复用这套网络配置。</p>
                 <form id="proxy-form">
                     <fieldset class="mb-3">
                         <legend class="form-label fs-6">代理类型</legend>
@@ -86,6 +91,10 @@
                         <div class="col-md-6">
                             <label for="proxy-password" class="form-label">密码（可选）</label>
                             <input id="proxy-password" class="form-control" type="password" autocomplete="new-password">
+                            <div class="form-check mt-2">
+                                <input id="proxy-clear-password" class="form-check-input" type="checkbox">
+                                <label class="form-check-label" for="proxy-clear-password">清除已保存的代理密码</label>
+                            </div>
                         </div>
                     </div>
                     <div class="mt-3 d-flex gap-2">

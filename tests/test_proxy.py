@@ -47,6 +47,10 @@ def test_save_validates_proxy_type_host_and_port_before_persisting(tmp_path):
         manager.save({"type": "http", "host": "", "port": 8080})
     with pytest.raises(ProxyConfigError, match="端口"):
         manager.save({"type": "socks5", "host": "localhost", "port": 70000})
+    with pytest.raises(ProxyConfigError, match="地址"):
+        manager.save({"type": "http", "host": "http://proxy.local/path", "port": 8080})
+    with pytest.raises(ProxyConfigError, match="地址"):
+        manager.save({"type": "http", "host": "bad host", "port": 8080})
 
     saved = manager.save(
         {
@@ -66,7 +70,73 @@ def test_save_validates_proxy_type_host_and_port_before_persisting(tmp_path):
         "password": "secret",
     }
     reloaded = ConfigManager(str(tmp_path / "config.yaml"))
-    assert reloaded.config["proxy"] == saved
+    assert reloaded.config["proxy"]["type"] == "socks5"
+    assert "password" not in reloaded.config["proxy"]
+    assert ProxyManager(reloaded).settings == saved
+
+
+def test_legacy_disabled_proxy_migrates_without_accidentally_enabling_socks(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config = ConfigManager(str(config_path))
+    config.config["proxy"] = {
+        "enabled": False,
+        "type": "socks5",
+        "host": "127.0.0.1",
+        "port": 1080,
+        "username": "",
+        "password": "",
+    }
+    config.save_config()
+
+    manager = ProxyManager(config)
+
+    assert manager.settings["type"] == "none"
+    persisted = ConfigManager(str(config_path)).config["proxy"]
+    assert persisted["type"] == "none"
+    assert "enabled" not in persisted
+    assert "password" not in persisted
+
+
+def test_saved_proxy_password_is_encrypted_and_can_be_explicitly_cleared(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config = ConfigManager(str(config_path))
+    manager = ProxyManager(config)
+
+    manager.save(
+        {
+            "type": "http",
+            "host": "proxy.local",
+            "port": 8080,
+            "username": "alice",
+            "password": "secret-password",
+        }
+    )
+
+    raw = config_path.read_text(encoding="utf-8")
+    assert "secret-password" not in raw
+    assert "password_encrypted:" in raw
+    assert manager.settings["password"] == "secret-password"
+
+    manager.save(
+        {
+            "type": "http",
+            "host": "proxy.local",
+            "port": 8080,
+            "username": "alice",
+            "password": "***",
+            "clear_password": True,
+        }
+    )
+    assert manager.settings["password"] == ""
+
+    manager.save({"type": "none"})
+    assert manager.settings == {
+        "type": "none",
+        "host": "",
+        "port": 0,
+        "username": "",
+        "password": "",
+    }
 
 
 def test_pixivpy_requests_receive_selected_proxy_and_none_disables_environment(tmp_path):
@@ -88,6 +158,27 @@ def test_pixivpy_requests_receive_selected_proxy_and_none_disables_environment(t
         "http": "http://127.0.0.1:7890",
         "https": "http://127.0.0.1:7890",
     }
+
+    manager.save({"type": "system"})
+    manager.apply_to_pixiv(api)
+    assert "proxies" not in api.requests_kwargs
+    assert api.requests.trust_env is True
+
+    manager.save(
+        {
+            "type": "socks5",
+            "host": "127.0.0.1",
+            "port": 1080,
+            "username": "alice",
+            "password": "p@ss word",
+        }
+    )
+    manager.apply_to_pixiv(api)
+    assert api.requests_kwargs["proxies"] == {
+        "http": "socks5h://alice:p%40ss%20word@127.0.0.1:1080",
+        "https": "socks5h://alice:p%40ss%20word@127.0.0.1:1080",
+    }
+    assert api.requests.trust_env is False
 
     manager.save({"type": "none"})
     manager.apply_to_pixiv(api)
@@ -116,6 +207,7 @@ async def test_aiohttp_options_cover_none_system_http_and_socks5(tmp_path):
     session_options, request_options = manager.aiohttp_options()
     assert session_options["trust_env"] is False
     assert session_options["connector"].__class__.__name__ == "ProxyConnector"
+    assert session_options["connector"]._rdns is True
     assert request_options == {}
 
 
@@ -162,3 +254,37 @@ async def test_connection_uses_aiohttp_proxy_options_without_real_network(tmp_pa
             "timeout": 10,
         }),
     ]
+
+
+@pytest.mark.asyncio
+async def test_connection_error_never_exposes_proxy_credentials(tmp_path):
+    class FailingSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def get(self, url, **kwargs):
+            raise RuntimeError(
+                "failed through http://alice:secret-password@proxy.local:3128"
+            )
+
+    config = ConfigManager(str(tmp_path / "config.yaml"))
+    manager = ProxyManager(config, session_factory=lambda **kwargs: FailingSession())
+    manager.save(
+        {
+            "type": "http",
+            "host": "proxy.local",
+            "port": 3128,
+            "username": "alice",
+            "password": "secret-password",
+        }
+    )
+
+    success, message = await manager.test_connection()
+
+    assert success is False
+    assert message == "Pixiv 连接失败，请检查网络或代理设置。"
+    assert "alice" not in message
+    assert "secret-password" not in message
