@@ -78,3 +78,119 @@ def test_start_app_opens_browser_and_runs_server(monkeypatch):
             },
         )
     ]
+
+
+class StubAuthManager:
+    def __init__(self, *, configured=False, error=None):
+        self.configured = configured
+        self.error = error
+        self.login_calls = []
+        self.get_access_token_calls = 0
+
+    def has_saved_token(self):
+        return self.configured
+
+    def get_access_token(self):
+        self.get_access_token_calls += 1
+        if self.error:
+            raise self.error
+        return "restored-access-token"
+
+    def login(self, refresh_token):
+        self.login_calls.append(refresh_token)
+        if self.error:
+            raise self.error
+        self.configured = True
+        return "access-token"
+
+
+def test_start_app_restores_saved_token_before_serving(monkeypatch):
+    stub = StubAuthManager(configured=True)
+    monkeypatch.setattr(app_module, "auth_manager", stub)
+    monkeypatch.setattr(app_module.socketio, "run", lambda *args, **kwargs: None)
+
+    app_module.start_app(port=54322, auto_open=False)
+
+    assert stub.get_access_token_calls == 1
+
+
+def test_first_start_page_shows_welcome_and_token_setup_steps(monkeypatch):
+    stub = StubAuthManager(configured=False)
+    monkeypatch.setattr(app_module, "auth_manager", stub)
+
+    response = app_module.app.test_client().get(
+        f"/?token={app_module.SECURITY_TOKEN}"
+    )
+    page = response.get_data(as_text=True)
+
+    assert response.status_code == 200
+    assert "步骤 1：欢迎" in page
+    assert "步骤 2：Token 配置" in page
+    assert 'id="refresh-token"' in page
+
+
+def test_auth_status_and_login_routes_report_success(monkeypatch):
+    stub = StubAuthManager(configured=False)
+    monkeypatch.setattr(app_module, "auth_manager", stub)
+    client = app_module.app.test_client()
+
+    assert client.get("/api/auth/status").get_json() == {"configured": False}
+
+    response = client.post(
+        "/api/auth/login", json={"refresh_token": "new-refresh-token"}
+    )
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "success": True,
+        "message": "Token 验证成功，已安全保存。",
+    }
+    assert stub.login_calls == ["new-refresh-token"]
+
+
+def test_config_api_masks_token_without_mutating_stored_value(tmp_path, monkeypatch):
+    from src.pixiv_downloader.config_manager import ConfigManager
+
+    config = ConfigManager(str(tmp_path / "config.yaml"))
+    config.update_setting("pixiv", "refresh_token", "encrypted-token")
+    monkeypatch.setattr(app_module, "config_manager", config)
+
+    response = app_module.app.test_client().get("/api/config")
+
+    assert response.status_code == 200
+    assert response.get_json()["pixiv"]["refresh_token"] == "***"
+    assert config.get_setting("pixiv", "refresh_token") == "encrypted-token"
+
+
+def test_config_api_rejects_plaintext_refresh_token_updates(tmp_path, monkeypatch):
+    from src.pixiv_downloader.config_manager import ConfigManager
+
+    config = ConfigManager(str(tmp_path / "config.yaml"))
+    config.update_setting("pixiv", "refresh_token", "encrypted-token")
+    monkeypatch.setattr(app_module, "config_manager", config)
+
+    response = app_module.app.test_client().post(
+        "/api/config", json={"pixiv": {"refresh_token": "plaintext-token"}}
+    )
+
+    assert response.status_code == 400
+    assert response.get_json() == {
+        "error": "Refresh Token 必须通过认证接口验证并加密保存"
+    }
+    assert config.get_setting("pixiv", "refresh_token") == "encrypted-token"
+
+
+def test_auth_login_route_reports_validation_failure(monkeypatch):
+    from src.pixiv_downloader.auth import AuthError
+
+    stub = StubAuthManager(error=AuthError("Token 验证失败：invalid"))
+    monkeypatch.setattr(app_module, "auth_manager", stub)
+
+    response = app_module.app.test_client().post(
+        "/api/auth/login", json={"refresh_token": "bad-token"}
+    )
+
+    assert response.status_code == 400
+    assert response.get_json() == {
+        "success": False,
+        "error": "Token 验证失败：invalid",
+    }

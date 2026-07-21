@@ -15,18 +15,46 @@
     </nav>
 
     <div class="container mt-4">
+        {% if needs_setup %}
+        <div id="setup-wizard" class="row g-4">
+            <div class="col-lg-5">
+                <div class="card h-100 border-primary">
+                    <div class="card-body">
+                        <span class="badge text-bg-primary mb-3">步骤 1：欢迎</span>
+                        <h1 class="card-title">欢迎使用 Pixiv 批量下载工具</h1>
+                        <p class="card-text">应用已成功启动。完成 Pixiv Refresh Token 配置后即可开始使用。</p>
+                    </div>
+                </div>
+            </div>
+            <div class="col-lg-7">
+                <div class="card h-100">
+                    <div class="card-body">
+                        <span class="badge text-bg-secondary mb-3">步骤 2：Token 配置</span>
+                        <h2 class="h4">连接 Pixiv</h2>
+                        <p class="text-muted">Token 只会在本机加密保存，不会显示在页面中。</p>
+                        <form id="token-form">
+                            <label for="refresh-token" class="form-label">Refresh Token</label>
+                            <textarea id="refresh-token" class="form-control" rows="3" required autocomplete="off"></textarea>
+                            <button id="token-submit" class="btn btn-primary mt-3" type="submit">验证并保存</button>
+                        </form>
+                        <div id="token-feedback" class="alert mt-3 d-none" role="alert"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        {% else %}
         <div class="row">
             <div class="col-12">
                 <div class="card">
                     <div class="card-body text-center">
                         <h1 class="card-title">欢迎使用 Pixiv 批量下载工具</h1>
                         <p class="card-text text-muted">版本 0.1.0</p>
-                        <p class="mt-4">应用已成功启动！</p>
-                        <p class="text-muted">后续功能开发中...</p>
+                        <p class="mt-4 text-success">Pixiv Token 已配置，可以开始使用。</p>
                     </div>
                 </div>
             </div>
         </div>
+        {% endif %}
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
