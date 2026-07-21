@@ -1,0 +1,10 @@
+Flask==3.0.0
+Flask-SocketIO==5.3.5
+python-socketio==5.10.0
+python-engineio==4.8.0
+PyYAML==6.0.1
+cryptography==41.0.7
+pixivpy3==3.7.3
+aiohttp==3.9.1
+pytest==7.4.3
+pytest-asyncio==0.21.1
