@@ -10,22 +10,27 @@ from .auth import AuthError, AuthManager
 from .config_manager import ConfigManager
 from .database import DatabaseManager
 from .proxy import ProxyConfigError, ProxyManager
+from .runtime import runtime_paths
 
-app = Flask(__name__, 
-            template_folder='../../templates',
-            static_folder='../../static')
+RUNTIME_PATHS = runtime_paths()
+app = Flask(
+    __name__,
+    template_folder=str(RUNTIME_PATHS.resource_dir / 'templates'),
+    static_folder=str(RUNTIME_PATHS.resource_dir / 'static'),
+)
 app.config['SECRET_KEY'] = secrets.token_hex(16)
 
 socketio = SocketIO(app, cors_allowed_origins="*")
-config_manager = ConfigManager()
+config_manager = ConfigManager(str(RUNTIME_PATHS.config_file))
 auth_manager = AuthManager(config_manager)
 proxy_manager = ProxyManager(config_manager)
-database_manager = DatabaseManager()
+database_manager = DatabaseManager(RUNTIME_PATHS.database_file)
 atexit.register(database_manager.close)
 
 # 生成随机 token 用于 URL
 SECURITY_TOKEN = secrets.token_urlsafe(16)
 startup_connectivity = None
+tray_icon = None
 
 @app.route('/')
 def index():
@@ -168,9 +173,16 @@ def handle_disconnect():
     """客户端断开"""
     print('Client disconnected')
 
-def start_app(host='127.0.0.1', port=5000, auto_open=True):
+def start_app(
+    host='127.0.0.1',
+    port=5000,
+    auto_open=True,
+    *,
+    enable_tray=False,
+    tray_factory=None,
+):
     """启动应用"""
-    global startup_connectivity
+    global startup_connectivity, tray_icon
     url = f'http://{host}:{port}?token={SECURITY_TOKEN}'
     print(f'Starting Pixiv Downloader...')
     print(f'Access URL: {url}')
@@ -192,6 +204,14 @@ def start_app(host='127.0.0.1', port=5000, auto_open=True):
             # 认证失败不阻止本地界面启动，用户仍可在引导页重新配置。
             print(f'Pixiv Token restore failed: {exc}')
     
+    if enable_tray:
+        if tray_factory is None:
+            from .tray import create_tray_icon
+
+            tray_factory = create_tray_icon
+        tray_icon = tray_factory(url)
+        tray_icon.run_detached()
+
     if auto_open:
         webbrowser.open(url)
     

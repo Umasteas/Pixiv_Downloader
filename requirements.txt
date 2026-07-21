@@ -10,3 +10,6 @@ aiohttp-socks==0.8.4
 PySocks==1.7.1
 pytest==7.4.3
 pytest-asyncio==0.21.1
+PyInstaller==6.21.0
+pystray==0.19.5
+Pillow==12.1.1
