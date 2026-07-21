@@ -164,10 +164,7 @@ class ArtistDownloader:
         single_page = _field(artwork, "meta_single_page", {}) or {}
         url = _field(single_page, "original_image_url")
         if not url:
-            image_urls = _field(artwork, "image_urls", {}) or {}
-            url = _field(image_urls, "large") or _field(image_urls, "medium")
-        if not url:
-            raise DownloadError("作品缺少可下载的图片地址")
+            raise DownloadError("作品缺少原图地址，拒绝下载非原图")
         return str(url)
 
     @staticmethod

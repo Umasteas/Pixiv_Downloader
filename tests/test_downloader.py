@@ -240,6 +240,41 @@ def test_artist_download_form_and_api(monkeypatch, tmp_path):
     assert "/api/download/artist" in script
 
 
+@pytest.mark.asyncio
+async def test_download_artwork_requires_original_url_and_never_marks_fallback(tmp_path):
+    from src.pixiv_downloader.downloader import ArtistDownloader, DownloadError
+
+    candidate = artwork(
+        meta_single_page={},
+        image_urls={"large": "https://i.pximg.net/img-master/not-original.jpg"},
+    )
+
+    class Database:
+        def __init__(self):
+            self.mark_calls = []
+
+        def is_downloaded(self, artwork_id):
+            return False
+
+        def mark_as_downloaded(self, *args, **kwargs):
+            self.mark_calls.append((args, kwargs))
+
+    database = Database()
+    downloader = ArtistDownloader(
+        api=object(),
+        database=database,
+        proxy_manager=object(),
+        output_dir=tmp_path,
+    )
+
+    with pytest.raises(DownloadError, match="原图"):
+        await downloader.download_artwork(candidate)
+
+    assert database.mark_calls == []
+    assert list(tmp_path.rglob("*.jpg")) == []
+    assert list(tmp_path.rglob("*.metadata.json")) == []
+
+
 def test_artist_download_api_redacts_authentication_errors(monkeypatch):
     from src.pixiv_downloader import app as app_module
 
