@@ -6,6 +6,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from pixivpy3 import AppPixivAPI
 
 from .config_manager import ConfigManager
+from .proxy import ProxyManager
 
 
 class AuthError(RuntimeError):
@@ -43,6 +44,7 @@ class AuthManager:
             raise AuthError("Refresh Token 不能为空")
 
         api = self.api_factory()
+        ProxyManager(self.config_manager).apply_to_pixiv(api)
         try:
             api.auth(refresh_token=refresh_token)
         except Exception as exc:

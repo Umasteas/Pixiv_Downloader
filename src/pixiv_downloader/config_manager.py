@@ -25,8 +25,7 @@ DEFAULT_CONFIG = {
         "ffmpeg_path": "auto"
     },
     "proxy": {
-        "enabled": False,
-        "type": "socks5",
+        "type": "none",
         "host": "127.0.0.1",
         "port": 1080,
         "username": "",

@@ -1,5 +1,6 @@
 """认证模块行为测试。"""
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +13,8 @@ class FakePixivAPI:
         self.reject = reject
         self.auth_calls = []
         self.access_token = None
+        self.requests = SimpleNamespace(trust_env=True)
+        self.requests_kwargs = {}
 
     def auth(self, *, refresh_token):
         self.auth_calls.append(refresh_token)
@@ -44,6 +47,26 @@ def test_login_encrypts_refresh_token_and_returns_access_token(tmp_path):
         encoding="utf-8"
     )
     assert manager.has_saved_token()
+
+
+def test_login_applies_saved_proxy_before_pixiv_authentication(tmp_path):
+    api = FakePixivAPI()
+    manager, config = make_manager(tmp_path, api)
+    config.config["proxy"] = {
+        "type": "http",
+        "host": "proxy.local",
+        "port": 8080,
+        "username": "",
+        "password": "",
+    }
+
+    manager.login("proxied-token")
+
+    assert api.requests_kwargs["proxies"] == {
+        "http": "http://proxy.local:8080",
+        "https": "http://proxy.local:8080",
+    }
+    assert api.auth_calls == ["proxied-token"]
 
 
 def test_failed_login_does_not_overwrite_saved_token(tmp_path):

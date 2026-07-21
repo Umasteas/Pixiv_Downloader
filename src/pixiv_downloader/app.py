@@ -1,4 +1,5 @@
 """Flask 应用主入口"""
+import asyncio
 import webbrowser
 import secrets
 import copy
@@ -8,6 +9,7 @@ from flask_socketio import SocketIO
 from .auth import AuthError, AuthManager
 from .config_manager import ConfigManager
 from .database import DatabaseManager
+from .proxy import ProxyConfigError, ProxyManager
 
 app = Flask(__name__, 
             template_folder='../../templates',
@@ -17,6 +19,7 @@ app.config['SECRET_KEY'] = secrets.token_hex(16)
 socketio = SocketIO(app, cors_allowed_origins="*")
 config_manager = ConfigManager()
 auth_manager = AuthManager(config_manager)
+proxy_manager = ProxyManager(config_manager)
 database_manager = DatabaseManager()
 atexit.register(database_manager.close)
 
@@ -59,6 +62,8 @@ def get_config():
     # 隐藏敏感信息，同时避免把掩码写回内存中的真实配置。
     if 'pixiv' in config and 'refresh_token' in config['pixiv']:
         config['pixiv']['refresh_token'] = '***' if config['pixiv']['refresh_token'] else ''
+    if 'proxy' in config and config['proxy'].get('password'):
+        config['proxy']['password'] = '***'
     return jsonify(config)
 
 @app.route('/api/config', methods=['POST'])
@@ -72,6 +77,10 @@ def update_config():
         return jsonify({
             "error": "Refresh Token 必须通过认证接口验证并加密保存"
         }), 400
+    if "proxy" in data:
+        return jsonify({
+            "error": "代理配置必须通过专用代理接口校验并保存"
+        }), 400
     
     for section, values in data.items():
         if isinstance(values, dict):
@@ -79,6 +88,49 @@ def update_config():
                 config_manager.update_setting(section, key, value)
     
     return jsonify({"success": True})
+
+
+def _public_proxy_settings(settings):
+    public = dict(settings)
+    if public.get("password"):
+        public["password"] = "***"
+    return public
+
+
+@app.route('/api/proxy', methods=['GET'])
+def get_proxy():
+    """返回不泄露密码的代理配置。"""
+    return jsonify({"proxy": _public_proxy_settings(proxy_manager.settings)})
+
+
+@app.route('/api/proxy', methods=['POST'])
+def update_proxy():
+    """校验并保存代理配置。"""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({
+            "success": False,
+            "error": "代理配置必须是 JSON 对象",
+        }), 400
+    if data.get("password") == "***":
+        data["password"] = proxy_manager.settings.get("password", "")
+    try:
+        saved = proxy_manager.save(data)
+    except ProxyConfigError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+    active_api = getattr(auth_manager, "api", None)
+    if active_api is not None:
+        proxy_manager.apply_to_pixiv(active_api)
+    return jsonify({"success": True, "proxy": _public_proxy_settings(saved)})
+
+
+@app.route('/api/proxy/test', methods=['POST'])
+def test_proxy():
+    """使用当前设置探测 Pixiv 可达性。"""
+    success, message = asyncio.run(proxy_manager.test_connection())
+    status = 200 if success else 502
+    return jsonify({"success": success, "message": message}), status
+
 
 @app.route('/api/tasks', methods=['GET'])
 def get_tasks():
@@ -108,6 +160,11 @@ def start_app(host='127.0.0.1', port=5000, auto_open=True):
     url = f'http://{host}:{port}?token={SECURITY_TOKEN}'
     print(f'Starting Pixiv Downloader...')
     print(f'Access URL: {url}')
+
+    reachable, connectivity_message = asyncio.run(proxy_manager.test_connection())
+    print(connectivity_message)
+    if not reachable:
+        print('Pixiv 当前不可达，请在设置页面配置代理后重试。')
 
     if auth_manager.has_saved_token():
         try:

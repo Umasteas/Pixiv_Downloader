@@ -51,11 +51,20 @@ def test_socketio_is_integrated_and_accepts_a_test_client():
         client.disconnect()
 
 
+def _stub_successful_connectivity(monkeypatch):
+    class StubProxyManager:
+        async def test_connection(self):
+            return True, "Pixiv 连接成功（HTTP 200）"
+
+    monkeypatch.setattr(app_module, "proxy_manager", StubProxyManager())
+
+
 def test_start_app_opens_browser_and_runs_server(monkeypatch):
     """启用 auto_open 时打开带 token 的 URL，然后启动 SocketIO 服务器。"""
     opened_urls = []
     run_calls = []
 
+    _stub_successful_connectivity(monkeypatch)
     monkeypatch.setattr(app_module.webbrowser, "open", opened_urls.append)
     monkeypatch.setattr(
         app_module.socketio,
@@ -106,12 +115,28 @@ class StubAuthManager:
 
 def test_start_app_restores_saved_token_before_serving(monkeypatch):
     stub = StubAuthManager(configured=True)
+    _stub_successful_connectivity(monkeypatch)
     monkeypatch.setattr(app_module, "auth_manager", stub)
     monkeypatch.setattr(app_module.socketio, "run", lambda *args, **kwargs: None)
 
     app_module.start_app(port=54322, auto_open=False)
 
     assert stub.get_access_token_calls == 1
+
+
+def test_start_app_reports_proxy_hint_when_pixiv_is_unreachable(monkeypatch, capsys):
+    class StubProxyManager:
+        async def test_connection(self):
+            return False, "Pixiv 连接失败：timeout"
+
+    monkeypatch.setattr(app_module, "proxy_manager", StubProxyManager())
+    monkeypatch.setattr(app_module.socketio, "run", lambda *args, **kwargs: None)
+
+    app_module.start_app(port=54323, auto_open=False)
+
+    output = capsys.readouterr().out
+    assert "Pixiv 连接失败：timeout" in output
+    assert "请在设置页面配置代理" in output
 
 
 def test_app_initializes_history_database_and_required_tables():
@@ -140,6 +165,40 @@ def test_first_start_page_shows_welcome_and_token_setup_steps(monkeypatch):
     assert "步骤 1：欢迎" in page
     assert "步骤 2：Token 配置" in page
     assert 'id="refresh-token"' in page
+
+
+def test_proxy_settings_ui_exposes_four_modes_credentials_and_actions(monkeypatch):
+    stub = StubAuthManager(configured=True)
+    monkeypatch.setattr(app_module, "auth_manager", stub)
+
+    response = app_module.app.test_client().get(
+        f"/?token={app_module.SECURITY_TOKEN}"
+    )
+    page = response.get_data(as_text=True)
+
+    assert response.status_code == 200
+    for value in ("none", "system", "http", "socks5"):
+        assert f'value="{value}"' in page
+    for element_id in (
+        "proxy-host",
+        "proxy-port",
+        "proxy-username",
+        "proxy-password",
+        "proxy-save",
+        "proxy-test",
+        "proxy-feedback",
+    ):
+        assert f'id="{element_id}"' in page
+
+
+def test_proxy_frontend_loads_saves_and_tests_through_api():
+    script = (PROJECT_ROOT / "static" / "app.js").read_text(encoding="utf-8")
+
+    assert "fetch('/api/proxy')" in script
+    assert "fetch('/api/proxy'," in script
+    assert "fetch('/api/proxy/test'" in script
+    assert "proxyForm.addEventListener('submit'" in script
+    assert "proxyTest.addEventListener('click'" in script
 
 
 def test_auth_status_and_login_routes_report_success(monkeypatch):
@@ -190,6 +249,105 @@ def test_config_api_rejects_plaintext_refresh_token_updates(tmp_path, monkeypatc
         "error": "Refresh Token 必须通过认证接口验证并加密保存"
     }
     assert config.get_setting("pixiv", "refresh_token") == "encrypted-token"
+
+
+def test_config_api_rejects_proxy_updates_that_bypass_validation(tmp_path, monkeypatch):
+    from src.pixiv_downloader.config_manager import ConfigManager
+
+    config = ConfigManager(str(tmp_path / "config.yaml"))
+    monkeypatch.setattr(app_module, "config_manager", config)
+
+    response = app_module.app.test_client().post(
+        "/api/config",
+        json={"proxy": {"type": "ftp", "password": "plaintext"}},
+    )
+
+    assert response.status_code == 400
+    assert response.get_json() == {
+        "error": "代理配置必须通过专用代理接口校验并保存"
+    }
+    assert config.config["proxy"]["type"] == "none"
+
+
+def test_proxy_api_saves_validated_yaml_and_masks_password(tmp_path, monkeypatch):
+    from src.pixiv_downloader.config_manager import ConfigManager
+    from src.pixiv_downloader.proxy import ProxyManager
+
+    config = ConfigManager(str(tmp_path / "config.yaml"))
+    manager = ProxyManager(config)
+    monkeypatch.setattr(app_module, "proxy_manager", manager)
+    client = app_module.app.test_client()
+
+    response = client.post(
+        "/api/proxy",
+        json={
+            "type": "http",
+            "host": "proxy.local",
+            "port": 8080,
+            "username": "alice",
+            "password": "secret",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["proxy"]["password"] == "***"
+    assert ConfigManager(str(tmp_path / "config.yaml")).config["proxy"]["password"] == "secret"
+    assert client.get("/api/proxy").get_json()["proxy"]["password"] == "***"
+
+
+def test_proxy_api_reapplies_saved_proxy_to_active_pixiv_session(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from src.pixiv_downloader.config_manager import ConfigManager
+    from src.pixiv_downloader.proxy import ProxyManager
+
+    config = ConfigManager(str(tmp_path / "config.yaml"))
+    manager = ProxyManager(config)
+    active_api = SimpleNamespace(
+        requests=SimpleNamespace(trust_env=True),
+        requests_kwargs={},
+    )
+    monkeypatch.setattr(app_module, "proxy_manager", manager)
+    monkeypatch.setattr(app_module.auth_manager, "api", active_api)
+
+    response = app_module.app.test_client().post(
+        "/api/proxy",
+        json={"type": "http", "host": "proxy.local", "port": 8080},
+    )
+
+    assert response.status_code == 200
+    assert active_api.requests_kwargs["proxies"] == {
+        "http": "http://proxy.local:8080",
+        "https": "http://proxy.local:8080",
+    }
+
+
+def test_proxy_api_rejects_non_object_json_without_server_error(monkeypatch):
+    client = app_module.app.test_client()
+
+    response = client.post("/api/proxy", json=["not", "an", "object"])
+
+    assert response.status_code == 400
+    assert response.get_json() == {
+        "success": False,
+        "error": "代理配置必须是 JSON 对象",
+    }
+
+
+def test_proxy_connection_endpoint_reports_mocked_network_result(monkeypatch):
+    class StubProxyManager:
+        async def test_connection(self):
+            return True, "Pixiv 连接成功（HTTP 200）"
+
+    monkeypatch.setattr(app_module, "proxy_manager", StubProxyManager())
+
+    response = app_module.app.test_client().post("/api/proxy/test")
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "success": True,
+        "message": "Pixiv 连接成功（HTTP 200）",
+    }
 
 
 def test_auth_login_route_reports_validation_failure(monkeypatch):
