@@ -77,6 +77,21 @@
                 </div>
             </div>
             <div class="col-12 mt-4">
+                <div id="task-panel" class="card">
+                    <div class="card-body">
+                        <div class="d-flex flex-wrap justify-content-between align-items-center gap-2">
+                            <div>
+                                <h2 class="h4 mb-1">下载任务</h2>
+                                <p class="text-muted mb-0">一次只执行一个任务；暂停或关闭后可从已保存进度恢复。</p>
+                            </div>
+                            <button id="task-refresh" class="btn btn-outline-secondary btn-sm" type="button">刷新</button>
+                        </div>
+                        <div id="task-list-feedback" class="alert mt-3 d-none" role="alert"></div>
+                        <div id="task-list" class="vstack gap-2 mt-3" aria-live="polite"></div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-12 mt-4">
                 <div id="follow-latest-panel" class="card">
                     <div class="card-body">
                         <div class="d-flex flex-wrap justify-content-between gap-3 align-items-center">

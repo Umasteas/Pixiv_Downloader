@@ -177,7 +177,7 @@ def test_fetch_artist_artworks_follows_pixiv_pagination_without_duplicate_user_i
     ]
 
 
-def test_artist_download_form_and_api(monkeypatch, tmp_path):
+def test_artist_download_form_and_api(monkeypatch):
     from src.pixiv_downloader import app as app_module
 
     calls = []
@@ -186,34 +186,18 @@ def test_artist_download_form_and_api(monkeypatch, tmp_path):
         api = object()
 
         def get_access_token(self):
-            calls.append("authenticated")
-            return "access"
+            raise AssertionError("创建 pending 任务时不应认证或下载")
 
         def has_saved_token(self):
             return True
 
-    class StubDownloader:
-        def __init__(self, api, database, proxy_manager, *, output_dir):
-            calls.append((api, database, proxy_manager, Path(output_dir)))
-
-        async def download_artist(self, artist_id):
-            calls.append(artist_id)
-            return {"total": 2, "downloaded": 1, "skipped": 1, "failed": 0}
-
-    from types import SimpleNamespace
+    class Manager:
+        def create_task(self, **task):
+            calls.append(task)
+            return 77
 
     monkeypatch.setattr(app_module, "auth_manager", StubAuth())
-    monkeypatch.setattr(app_module, "ArtistDownloader", StubDownloader, raising=False)
-    monkeypatch.setattr(
-        app_module,
-        "RUNTIME_PATHS",
-        SimpleNamespace(application_dir=tmp_path),
-    )
-    monkeypatch.setitem(
-        app_module.config_manager.config["download"],
-        "output_dir",
-        "./downloads",
-    )
+    monkeypatch.setattr(app_module, "task_manager", Manager())
     client = app_module.app.test_client()
 
     invalid = client.post("/api/download/artist", json={"artist_id": 0})
@@ -226,19 +210,148 @@ def test_artist_download_form_and_api(monkeypatch, tmp_path):
 
     assert invalid.status_code == 400
     assert float_id.status_code == 400
-    assert response.status_code == 200
+    assert response.status_code == 201
     assert response.get_json() == {
         "success": True,
-        "result": {"total": 2, "downloaded": 1, "skipped": 1, "failed": 0},
+        "task_id": 77,
+        "status": "pending",
     }
-    assert calls == [
-        "authenticated",
-        (StubAuth.api, app_module.database_manager, app_module.proxy_manager, tmp_path / "downloads"),
-        456,
-    ]
+    assert calls == [{"task_type": "artist", "query": {"artist_id": 456}}]
     assert 'id="artist-download-form"' in page
     assert 'id="artist-id"' in page
-    assert "/api/download/artist" in script
+    assert "/api/tasks" in script
+
+
+@pytest.mark.asyncio
+async def test_artist_download_resumes_from_checkpoint_and_records_task_progress(tmp_path):
+    from src.pixiv_downloader.downloader import ArtistDownloader
+
+    class Api:
+        def user_illusts(self, artist_id, **kwargs):
+            return {
+                "illusts": [artwork(id=1), artwork(id=2), artwork(id=3)],
+                "next_url": None,
+            }
+
+    class Database:
+        def __init__(self):
+            self.mark_calls = []
+
+        def is_downloaded(self, artwork_id):
+            return False
+
+        def mark_as_downloaded(self, artwork_id, **kwargs):
+            self.mark_calls.append((artwork_id, kwargs))
+
+    class Proxy:
+        def aiohttp_options(self):
+            return {}, {}
+
+    class Control:
+        def __init__(self):
+            self.checkpoints = 0
+            self.results = []
+            self.totals = []
+
+        def set_total(self, total):
+            self.totals.append(total)
+
+        def checkpoint(self):
+            self.checkpoints += 1
+            return self.checkpoints == 1
+
+        def record_result(self, result):
+            self.results.append(result)
+
+    database = Database()
+    control = Control()
+    downloader = ArtistDownloader(
+        Api(),
+        database,
+        Proxy(),
+        output_dir=tmp_path,
+        session_factory=FakeSession,
+    )
+
+    result = await downloader.download_artist(
+        456,
+        task_id=77,
+        start_index=1,
+        control=control,
+    )
+
+    assert result == {"total": 3, "downloaded": 1, "skipped": 0, "failed": 0}
+    assert control.totals == [3]
+    assert control.checkpoints == 2
+    assert control.results == ["downloaded"]
+    assert [call[0] for call in database.mark_calls] == [2]
+    assert database.mark_calls[0][1]["task_id"] == 77
+
+
+@pytest.mark.asyncio
+async def test_selected_artwork_task_resumes_and_records_progress(tmp_path):
+    from src.pixiv_downloader.downloader import ArtistDownloader
+
+    class Api:
+        def __init__(self):
+            self.calls = []
+
+        def illust_detail(self, artwork_id):
+            self.calls.append(artwork_id)
+            return {"illust": artwork(id=artwork_id)}
+
+    class Database:
+        def __init__(self):
+            self.mark_calls = []
+
+        def is_downloaded(self, artwork_id):
+            return False
+
+        def mark_as_downloaded(self, artwork_id, **kwargs):
+            self.mark_calls.append((artwork_id, kwargs))
+
+    class Proxy:
+        def aiohttp_options(self):
+            return {}, {}
+
+    class Control:
+        def __init__(self):
+            self.total = None
+            self.results = []
+
+        def set_total(self, total):
+            self.total = total
+
+        def checkpoint(self):
+            return True
+
+        def record_result(self, result):
+            self.results.append(result)
+
+    api = Api()
+    database = Database()
+    control = Control()
+    downloader = ArtistDownloader(
+        api,
+        database,
+        Proxy(),
+        output_dir=tmp_path,
+        session_factory=FakeSession,
+    )
+
+    result = await downloader.download_artwork_ids(
+        [10, 20, 30],
+        task_id=88,
+        start_index=1,
+        control=control,
+    )
+
+    assert result == {"total": 3, "downloaded": 2, "skipped": 0, "failed": 0}
+    assert api.calls == [20, 30]
+    assert control.total == 3
+    assert control.results == ["downloaded", "downloaded"]
+    assert [call[0] for call in database.mark_calls] == [20, 30]
+    assert all(call[1]["task_id"] == 88 for call in database.mark_calls)
 
 
 @pytest.mark.asyncio
@@ -276,26 +389,26 @@ async def test_download_artwork_requires_original_url_and_never_marks_fallback(t
     assert list(tmp_path.rglob("*.metadata.json")) == []
 
 
-def test_artist_download_api_redacts_authentication_errors(monkeypatch):
+def test_task_start_redacts_background_authentication_errors(monkeypatch):
     from src.pixiv_downloader import app as app_module
 
-    class FailingAuth:
-        api = None
-
-        def get_access_token(self):
+    class Manager:
+        def start_task(self, task_id):
             raise app_module.AuthError(
                 "Token 验证失败: https://alice:secret-password@proxy.local"
             )
 
-    monkeypatch.setattr(app_module, "auth_manager", FailingAuth())
-    response = app_module.app.test_client().post(
-        "/api/download/artist",
-        json={"artist_id": 456},
+    monkeypatch.setattr(app_module, "task_manager", Manager())
+    monkeypatch.setattr(
+        app_module.socketio,
+        "start_background_task",
+        lambda target, *args: target(*args),
     )
+    response = app_module.app.test_client().post("/api/tasks/1/start")
     payload = response.get_json()
 
-    assert response.status_code == 401
-    assert payload == {"success": False, "error": "Pixiv 登录失败，请重新配置 Token。"}
+    assert response.status_code == 202
+    assert payload == {"success": True, "status": "accepted"}
     serialized = json.dumps(payload, ensure_ascii=False)
     assert "alice" not in serialized
     assert "secret-password" not in serialized

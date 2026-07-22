@@ -14,6 +14,7 @@ from .downloader import ArtistDownloader
 from .follow_latest import FollowLatestError, FollowLatestScanner
 from .proxy import ProxyConfigError, ProxyManager
 from .runtime import runtime_paths
+from .task_manager import TaskManager, TaskManagerError
 
 RUNTIME_PATHS = runtime_paths()
 app = Flask(
@@ -29,6 +30,62 @@ auth_manager = AuthManager(config_manager)
 proxy_manager = ProxyManager(config_manager)
 database_manager = DatabaseManager(RUNTIME_PATHS.database_file)
 atexit.register(database_manager.close)
+
+
+def _execute_download_task(task, control):
+    """执行画师或关注选中项任务，并从持久化计数位置续传。"""
+    query = task.get("query")
+    if not isinstance(query, dict):
+        raise TaskManagerError("任务缺少有效查询")
+    task_type = task["task_type"]
+    if task_type == "artist":
+        value = query.get("artist_id")
+        if type(value) is not int or value <= 0:
+            raise TaskManagerError("画师任务缺少有效 ID")
+    elif task_type == "follow_latest":
+        value = query.get("artwork_ids")
+        if (
+            not isinstance(value, list)
+            or not value
+            or any(type(item) is not int or item <= 0 for item in value)
+        ):
+            raise TaskManagerError("关注任务缺少有效作品 ID")
+    else:
+        raise TaskManagerError("暂不支持该任务类型")
+    auth_manager.get_access_token()
+    if auth_manager.api is None:
+        raise AuthError("Pixiv 登录状态不可用")
+    configured_output = Path(
+        config_manager.get_setting("download", "output_dir", "./downloads")
+    )
+    output_dir = (
+        configured_output
+        if configured_output.is_absolute()
+        else RUNTIME_PATHS.application_dir / configured_output
+    )
+    processed = sum(
+        int(task.get(key) or 0)
+        for key in ("downloaded_count", "skipped_count", "failed_count")
+    )
+    downloader = ArtistDownloader(
+        auth_manager.api,
+        database_manager,
+        proxy_manager,
+        output_dir=output_dir.resolve(),
+    )
+    options = {
+        "task_id": task["task_id"],
+        "start_index": processed,
+        "control": control,
+    }
+    if task_type == "artist":
+        operation = downloader.download_artist(value, **options)
+    else:
+        operation = downloader.download_artwork_ids(value, **options)
+    asyncio.run(operation)
+
+
+task_manager = TaskManager(database_manager, _execute_download_task)
 
 # 生成随机 token 用于 URL
 SECURITY_TOKEN = secrets.token_urlsafe(16)
@@ -161,37 +218,15 @@ def download_artist():
     if type(raw_artist_id) is not int or raw_artist_id <= 0:
         return jsonify({"success": False, "error": "画师 ID 必须是正整数"}), 400
     artist_id = raw_artist_id
-
-    try:
-        auth_manager.get_access_token()
-        if auth_manager.api is None:
-            raise AuthError("Pixiv 登录状态不可用")
-        configured_output = Path(
-            config_manager.get_setting("download", "output_dir", "./downloads")
-        )
-        output_dir = (
-            configured_output
-            if configured_output.is_absolute()
-            else RUNTIME_PATHS.application_dir / configured_output
-        )
-        downloader = ArtistDownloader(
-            auth_manager.api,
-            database_manager,
-            proxy_manager,
-            output_dir=output_dir.resolve(),
-        )
-        result = asyncio.run(downloader.download_artist(artist_id))
-    except AuthError:
-        return jsonify({
-            "success": False,
-            "error": "Pixiv 登录失败，请重新配置 Token。",
-        }), 401
-    except Exception:
-        return jsonify({
-            "success": False,
-            "error": "画师作品下载失败，请检查网络、代理和磁盘空间。",
-        }), 500
-    return jsonify({"success": True, "result": result})
+    task_id = task_manager.create_task(
+        task_type="artist",
+        query={"artist_id": artist_id},
+    )
+    return jsonify({
+        "success": True,
+        "task_id": task_id,
+        "status": "pending",
+    }), 201
 
 
 @app.route('/api/follow/latest', methods=['POST'])
@@ -270,15 +305,54 @@ def get_download_stats():
 @app.route('/api/tasks', methods=['GET'])
 def get_tasks():
     """获取任务列表"""
-    # TODO: 实现任务查询
-    return jsonify({"tasks": []})
+    return jsonify({"tasks": task_manager.list_tasks()})
 
 @app.route('/api/tasks', methods=['POST'])
 def create_task():
     """创建任务"""
-    # TODO: 实现任务创建
-    data = request.json
-    return jsonify({"success": True, "task_id": 1})
+    data = request.get_json(silent=True)
+    query = data.get("query") if isinstance(data, dict) else None
+    artist_id = query.get("artist_id") if isinstance(query, dict) else None
+    if (
+        not isinstance(data, dict)
+        or data.get("task_type") != "artist"
+        or type(artist_id) is not int
+        or artist_id <= 0
+    ):
+        return jsonify({
+            "success": False,
+            "error": "画师任务必须包含正整数 artist_id。",
+        }), 400
+    task_id = task_manager.create_task(task_type="artist", query={"artist_id": artist_id})
+    return jsonify({"success": True, "task_id": task_id, "status": "pending"}), 201
+
+
+def _run_task_action(target, task_id):
+    """隔离后台异常，避免认证或代理细节泄露到控制台。"""
+    try:
+        target(task_id)
+    except Exception:
+        return
+
+
+@app.route('/api/tasks/<int:task_id>/<action>', methods=['POST'])
+def control_task(task_id, action):
+    """开始、暂停、恢复或取消持久化任务。"""
+    if action in {"start", "resume"}:
+        target = task_manager.start_task if action == "start" else task_manager.resume_task
+        socketio.start_background_task(_run_task_action, target, task_id)
+        return jsonify({"success": True, "status": "accepted"}), 202
+    target = {
+        "pause": task_manager.pause_task,
+        "cancel": task_manager.cancel_task,
+    }.get(action)
+    if target is None:
+        return jsonify({"success": False, "error": "未知任务操作。"}), 404
+    try:
+        task = target(task_id)
+    except TaskManagerError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 409
+    return jsonify({"success": True, "task": task})
 
 @socketio.on('connect')
 def handle_connect():

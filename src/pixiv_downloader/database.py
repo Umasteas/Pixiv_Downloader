@@ -192,6 +192,18 @@ class DatabaseManager:
             ).fetchone()
         if row is None:
             return None
+        return self._decode_task(row)
+
+    def list_tasks(self) -> list[dict[str, Any]]:
+        """按最新创建顺序返回全部持久化任务。"""
+        with self._lock:
+            rows = self.connection.execute(
+                "SELECT * FROM tasks ORDER BY created_time DESC, task_id DESC"
+            ).fetchall()
+        return [self._decode_task(row) for row in rows]
+
+    @staticmethod
+    def _decode_task(row: sqlite3.Row) -> dict[str, Any]:
         item = dict(row)
         for key in ("query", "filters"):
             value = item.get(key)
@@ -201,6 +213,68 @@ class DatabaseManager:
                 except (TypeError, json.JSONDecodeError):
                     pass
         return item
+
+    def transition_task(
+        self,
+        task_id: int,
+        expected_status: str,
+        new_status: str,
+    ) -> Optional[dict[str, Any]]:
+        """仅在当前状态匹配时原子转换任务状态。"""
+        assignments = ["status = ?"]
+        parameters: list[Any] = [new_status]
+        if new_status == "running":
+            assignments.append("started_time = COALESCE(started_time, CURRENT_TIMESTAMP)")
+        if new_status in {"completed", "cancelled", "failed"}:
+            assignments.append("completed_time = CURRENT_TIMESTAMP")
+        with self._lock, self.connection:
+            cursor = self.connection.execute(
+                f"UPDATE tasks SET {', '.join(assignments)} "
+                "WHERE task_id = ? AND status = ?",
+                (*parameters, task_id, expected_status),
+            )
+        return self.get_task(task_id) if cursor.rowcount == 1 else None
+
+    def record_task_result(
+        self,
+        task_id: int,
+        result: str,
+    ) -> Optional[dict[str, Any]]:
+        """原子累加任务的单项处理结果。"""
+        columns = {
+            "downloaded": "downloaded_count",
+            "skipped": "skipped_count",
+            "failed": "failed_count",
+        }
+        try:
+            column = columns[result]
+        except KeyError as exc:
+            raise ValueError("result 必须是 downloaded、skipped 或 failed") from exc
+        with self._lock, self.connection:
+            cursor = self.connection.execute(
+                f"UPDATE tasks SET {column} = {column} + 1 "
+                "WHERE task_id = ? AND status NOT IN ('completed', 'failed')",
+                (task_id,),
+            )
+        return self.get_task(task_id) if cursor.rowcount == 1 else None
+
+    def set_task_total(self, task_id: int, total_count: int) -> Optional[dict[str, Any]]:
+        """持久化运行任务的总作品数。"""
+        with self._lock, self.connection:
+            cursor = self.connection.execute(
+                "UPDATE tasks SET total_count = ? "
+                "WHERE task_id = ? AND status IN ('running', 'paused')",
+                (total_count, task_id),
+            )
+        return self.get_task(task_id) if cursor.rowcount == 1 else None
+
+    def recover_interrupted_tasks(self) -> int:
+        """把上次进程遗留的 running 任务恢复为 paused。"""
+        with self._lock, self.connection:
+            cursor = self.connection.execute(
+                "UPDATE tasks SET status = 'paused' WHERE status = 'running'"
+            )
+        return cursor.rowcount
 
     def get_followed_artist(self, artist_id: int) -> Optional[dict[str, Any]]:
         """返回指定关注画师的最近检查状态。"""

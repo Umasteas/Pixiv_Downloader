@@ -104,6 +104,7 @@ class ArtistDownloader:
         *,
         session=None,
         request_options: dict[str, Any] | None = None,
+        task_id: int | None = None,
     ) -> str:
         """下载一个未下载的单图作品并记录元数据和数据库历史。"""
         artwork_id = int(_field(artwork, "id"))
@@ -128,36 +129,91 @@ class ArtistDownloader:
         )
         user = _field(artwork, "user", {})
         tags = metadata["tags"]
-        self.database.mark_as_downloaded(
-            artwork_id,
-            artist_id=int(_field(user, "id")),
-            artist_name=str(_field(user, "name", "")),
-            title=str(_field(artwork, "title", "")),
-            file_path=str(save_path),
-            file_size=save_path.stat().st_size,
-            page_count=1,
-            bookmarks=int(_field(artwork, "total_bookmarks", 0) or 0),
-            tags=tags,
-        )
+        record = {
+            "artist_id": int(_field(user, "id")),
+            "artist_name": str(_field(user, "name", "")),
+            "title": str(_field(artwork, "title", "")),
+            "file_path": str(save_path),
+            "file_size": save_path.stat().st_size,
+            "page_count": 1,
+            "bookmarks": int(_field(artwork, "total_bookmarks", 0) or 0),
+            "tags": tags,
+        }
+        if task_id is not None:
+            record["task_id"] = task_id
+        self.database.mark_as_downloaded(artwork_id, **record)
         return "downloaded"
 
-    async def download_artist(self, artist_id: int) -> dict[str, int]:
+    async def download_artist(
+        self,
+        artist_id: int,
+        *,
+        task_id: int | None = None,
+        start_index: int = 0,
+        control=None,
+    ) -> dict[str, int]:
         """下载画师的全部单图，单个作品失败时继续后续作品。"""
         artworks = self.fetch_artist_artworks(int(artist_id))
-        result = {"total": len(artworks), "downloaded": 0, "skipped": 0, "failed": 0}
+        return await self._download_items(
+            artworks,
+            lambda artwork: artwork,
+            task_id=task_id,
+            start_index=start_index,
+            control=control,
+        )
+
+    async def download_artwork_ids(
+        self,
+        artwork_ids: list[int],
+        *,
+        task_id: int | None = None,
+        start_index: int = 0,
+        control=None,
+    ) -> dict[str, int]:
+        """按作品 ID 下载选中作品，可从持久化索引继续。"""
+        def fetch(artwork_id: int):
+            artwork = _field(self.api.illust_detail(int(artwork_id)), "illust")
+            if artwork is None:
+                raise DownloadError("作品详情不存在")
+            return artwork
+
+        return await self._download_items(
+            artwork_ids,
+            fetch,
+            task_id=task_id,
+            start_index=start_index,
+            control=control,
+        )
+
+    async def _download_items(
+        self,
+        items: list[Any],
+        resolve: Callable[[Any], Any],
+        *,
+        task_id: int | None,
+        start_index: int,
+        control,
+    ) -> dict[str, int]:
+        result = {"total": len(items), "downloaded": 0, "skipped": 0, "failed": 0}
+        if control is not None:
+            control.set_total(len(items))
         session_options, request_options = self.proxy_manager.aiohttp_options()
         async with self.session_factory(**session_options) as session:
-            for artwork in artworks:
+            for item in items[start_index:]:
+                if control is not None and not control.checkpoint():
+                    break
                 try:
                     status = await self.download_artwork(
-                        artwork,
+                        resolve(item),
                         session=session,
                         request_options=request_options,
+                        task_id=task_id,
                     )
                 except Exception:
-                    result["failed"] += 1
-                else:
-                    result[status] += 1
+                    status = "failed"
+                result[status] += 1
+                if control is not None:
+                    control.record_result(status)
         return result
 
     @staticmethod

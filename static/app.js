@@ -158,6 +158,87 @@ if (proxyForm && proxyTest) {
         .catch((error) => showProxyFeedback('danger', `代理配置加载失败：${error.message}`));
 }
 
+const taskList = document.getElementById('task-list');
+const taskListFeedback = document.getElementById('task-list-feedback');
+const taskStatusLabels = {
+    pending: '等待中', running: '运行中', paused: '已暂停', completed: '已完成',
+    cancelled: '已取消', failed: '失败',
+};
+const taskActions = {
+    pending: [['start', '开始'], ['cancel', '取消']],
+    running: [['pause', '暂停'], ['cancel', '取消']],
+    paused: [['resume', '恢复'], ['cancel', '取消']],
+};
+
+const renderTasks = (tasks) => {
+    taskList.replaceChildren();
+    if (!tasks.length) {
+        const empty = document.createElement('p');
+        empty.className = 'text-muted mb-0';
+        empty.textContent = '暂无下载任务。';
+        taskList.append(empty);
+        return;
+    }
+    tasks.forEach((task) => {
+        const processed = task.downloaded_count + task.skipped_count + task.failed_count;
+        const total = task.total_count ?? '待获取';
+        const card = document.createElement('div');
+        card.className = 'border rounded p-3 d-flex flex-wrap justify-content-between gap-3';
+        const summary = document.createElement('div');
+        const artistId = task.query?.artist_id;
+        summary.textContent = `#${task.task_id} · ${artistId ? `画师 ${artistId}` : task.task_type} · ${taskStatusLabels[task.status] || task.status} · 进度 ${processed}/${total} · 下载 ${task.downloaded_count} / 跳过 ${task.skipped_count} / 失败 ${task.failed_count}`;
+        const controls = document.createElement('div');
+        controls.className = 'd-flex gap-2';
+        (taskActions[task.status] || []).forEach(([action, label]) => {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = `btn btn-sm ${action === 'cancel' ? 'btn-outline-danger' : 'btn-outline-primary'}`;
+            button.dataset.taskId = task.task_id;
+            button.dataset.taskAction = action;
+            button.textContent = label;
+            controls.append(button);
+        });
+        card.append(summary, controls);
+        taskList.append(card);
+    });
+};
+
+const loadTasks = async () => {
+    if (!taskList) return;
+    try {
+        const response = await fetch('/api/tasks');
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || '任务列表加载失败。');
+        renderTasks(payload.tasks);
+        taskListFeedback.className = 'alert mt-3 d-none';
+    } catch (error) {
+        taskListFeedback.className = 'alert alert-danger mt-3';
+        taskListFeedback.textContent = error.message;
+    }
+};
+
+if (taskList) {
+    document.getElementById('task-refresh').addEventListener('click', loadTasks);
+    taskList.addEventListener('click', async (event) => {
+        const button = event.target.closest('[data-task-action]');
+        if (!button) return;
+        button.disabled = true;
+        try {
+            const response = await fetch(`/api/tasks/${button.dataset.taskId}/${button.dataset.taskAction}`, { method: 'POST' });
+            const payload = await response.json();
+            if (!response.ok) throw new Error(payload.error || '任务操作失败。');
+            await loadTasks();
+        } catch (error) {
+            taskListFeedback.className = 'alert alert-danger mt-3';
+            taskListFeedback.textContent = error.message;
+        } finally {
+            button.disabled = false;
+        }
+    });
+    loadTasks();
+    window.setInterval(loadTasks, 1000);
+}
+
 const artistDownloadForm = document.getElementById('artist-download-form');
 
 if (artistDownloadForm) {
@@ -169,21 +250,24 @@ if (artistDownloadForm) {
         event.preventDefault();
         submitButton.disabled = true;
         feedback.className = 'alert alert-info mt-3';
-        feedback.textContent = '正在获取画师作品并下载，请稍候…';
+        feedback.textContent = '正在创建下载任务…';
 
         try {
-            const response = await fetch('/api/download/artist', {
+            const response = await fetch('/api/tasks', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ artist_id: Number(artistIdInput.value) }),
+                body: JSON.stringify({
+                    task_type: 'artist',
+                    query: { artist_id: Number(artistIdInput.value) },
+                }),
             });
             const payload = await response.json();
             if (!response.ok) {
-                throw new Error(payload.error || '画师作品下载失败。');
+                throw new Error(payload.error || '画师任务创建失败。');
             }
-            const result = payload.result;
-            feedback.className = `alert alert-${result.failed ? 'warning' : 'success'} mt-3`;
-            feedback.textContent = `处理 ${result.total} 个作品：下载 ${result.downloaded}，跳过 ${result.skipped}，失败 ${result.failed}。`;
+            feedback.className = 'alert alert-success mt-3';
+            feedback.textContent = `已创建等待中的任务 #${payload.task_id}，请在任务列表中开始。`;
+            await loadTasks();
         } catch (error) {
             feedback.className = 'alert alert-danger mt-3';
             feedback.textContent = error.message;
