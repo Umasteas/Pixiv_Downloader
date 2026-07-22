@@ -66,6 +66,7 @@ class ArtistDownloader:
         session=None,
         *,
         request_options: dict[str, Any] | None = None,
+        progress: Callable[[str, int, int | None, bool], None] | None = None,
     ) -> None:
         """通过统一代理配置流式下载文件，并原子替换目标。"""
         save_path = Path(save_path)
@@ -84,10 +85,24 @@ class ArtistDownloader:
             try:
                 async with active_session.get(url, **request_options) as response:
                     response.raise_for_status()
+                    total_bytes = getattr(response, "content_length", None)
+                    downloaded_bytes = 0
+                    if progress is not None:
+                        progress(save_path.name, 0, total_bytes, False)
                     with temporary.open("wb") as output:
                         async for chunk in response.content.iter_chunked(64 * 1024):
                             output.write(chunk)
+                            downloaded_bytes += len(chunk)
+                            if progress is not None:
+                                progress(
+                                    save_path.name,
+                                    downloaded_bytes,
+                                    total_bytes,
+                                    False,
+                                )
                 temporary.replace(save_path)
+                if progress is not None:
+                    progress(save_path.name, downloaded_bytes, total_bytes, True)
             except Exception:
                 temporary.unlink(missing_ok=True)
                 raise
@@ -105,6 +120,7 @@ class ArtistDownloader:
         session=None,
         request_options: dict[str, Any] | None = None,
         task_id: int | None = None,
+        progress: Callable[[str, int, int | None, bool], None] | None = None,
     ) -> str:
         """下载一个未下载的单图作品并记录元数据和数据库历史。"""
         artwork_id = int(_field(artwork, "id"))
@@ -120,6 +136,7 @@ class ArtistDownloader:
             save_path,
             session=session,
             request_options=request_options,
+            progress=progress,
         )
 
         metadata = self._metadata(artwork, save_path)
@@ -208,6 +225,11 @@ class ArtistDownloader:
                         session=session,
                         request_options=request_options,
                         task_id=task_id,
+                        progress=(
+                            getattr(control, "file_progress", None)
+                            if control is not None
+                            else None
+                        ),
                     )
                 except Exception:
                     status = "failed"

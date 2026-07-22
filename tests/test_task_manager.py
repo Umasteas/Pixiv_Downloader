@@ -41,6 +41,305 @@ def test_task_manager_create_start_complete_persists(tmp_path):
         reopened.close()
 
 
+def test_task_manager_publishes_completed_after_database_terminal_state(tmp_path):
+    from src.pixiv_downloader.database import DatabaseManager
+    from src.pixiv_downloader.task_manager import TaskManager
+
+    database = DatabaseManager(tmp_path / "history.db")
+    events = []
+
+    def publish(event, payload):
+        events.append((event, payload, database.get_task(payload["task_id"])["status"]))
+
+    try:
+        manager = TaskManager(database, lambda task, control: None, publish=publish)
+        task_id = manager.create_task(task_type="artist", query={"artist_id": 456})
+
+        completed = manager.start_task(task_id)
+
+        assert completed["status"] == "completed"
+        assert events == [
+            (
+                "task_complete",
+                {
+                    "task_id": task_id,
+                    "status": "completed",
+                    "total_count": None,
+                    "downloaded_count": 0,
+                    "skipped_count": 0,
+                    "failed_count": 0,
+                },
+                "completed",
+            )
+        ]
+    finally:
+        database.close()
+
+
+def test_task_manager_isolates_event_publisher_failure_from_completed_task(tmp_path):
+    from src.pixiv_downloader.database import DatabaseManager
+    from src.pixiv_downloader.task_manager import TaskManager
+
+    database = DatabaseManager(tmp_path / "history.db")
+
+    def publish(event, payload):
+        raise RuntimeError("事件通道不可用")
+
+    try:
+        manager = TaskManager(database, lambda task, control: None, publish=publish)
+        task_id = manager.create_task(task_type="artist", query={"artist_id": 456})
+
+        result = manager.start_task(task_id)
+
+        assert result["status"] == "completed"
+        assert database.get_task(task_id)["status"] == "completed"
+    finally:
+        database.close()
+
+
+def test_task_manager_preserves_executor_error_when_error_publisher_fails(tmp_path):
+    from src.pixiv_downloader.database import DatabaseManager
+    from src.pixiv_downloader.task_manager import TaskManager
+
+    database = DatabaseManager(tmp_path / "history.db")
+
+    def execute(task, control):
+        raise ValueError("原始执行错误")
+
+    def publish(event, payload):
+        raise RuntimeError("事件通道不可用")
+
+    try:
+        manager = TaskManager(database, execute, publish=publish)
+        task_id = manager.create_task(task_type="artist", query={"artist_id": 456})
+
+        with pytest.raises(ValueError, match="原始执行错误"):
+            manager.start_task(task_id)
+
+        assert database.get_task(task_id)["status"] == "failed"
+    finally:
+        database.close()
+
+
+def test_task_manager_publishes_sanitized_error_after_failed_state(tmp_path):
+    from src.pixiv_downloader.database import DatabaseManager
+    from src.pixiv_downloader.task_manager import TaskManager
+
+    database = DatabaseManager(tmp_path / "history.db")
+    events = []
+
+    def execute(task, control):
+        raise RuntimeError("https://alice:secret-password@proxy.local")
+
+    def publish(event, payload):
+        events.append((event, payload, database.get_task(payload["task_id"])["status"]))
+
+    try:
+        manager = TaskManager(database, execute, publish=publish)
+        task_id = manager.create_task(task_type="artist", query={"artist_id": 456})
+
+        with pytest.raises(RuntimeError, match="secret-password"):
+            manager.start_task(task_id)
+
+        assert events == [
+            (
+                "error",
+                {
+                    "task_id": task_id,
+                    "status": "failed",
+                    "message": "任务执行失败，请检查网络、代理或登录状态。",
+                },
+                "failed",
+            )
+        ]
+        assert "alice" not in repr(events)
+        assert "secret-password" not in repr(events)
+        assert "proxy.local" not in repr(events)
+    finally:
+        database.close()
+
+
+def test_task_control_publishes_persisted_progress_snapshots(tmp_path):
+    from src.pixiv_downloader.database import DatabaseManager
+    from src.pixiv_downloader.task_manager import TaskManager
+
+    database = DatabaseManager(tmp_path / "history.db")
+    events = []
+    ticks = iter([0.0, 0.0, 1.0, 2.0])
+
+    def execute(task, control):
+        control.set_total(2)
+        control.record_result("downloaded")
+        control.record_result("skipped")
+
+    try:
+        manager = TaskManager(
+            database,
+            execute,
+            publish=lambda event, payload: events.append((event, payload)),
+            clock=lambda: next(ticks),
+        )
+        task_id = manager.create_task(task_type="artist", query={"artist_id": 456})
+
+        manager.start_task(task_id)
+
+        progress = [payload for event, payload in events if event == "progress_update"]
+        assert [
+            (
+                item["total_count"],
+                item["downloaded_count"],
+                item["skipped_count"],
+                item["failed_count"],
+            )
+            for item in progress
+        ] == [(2, 0, 0, 0), (2, 1, 0, 0), (2, 1, 1, 0)]
+        assert all(item["task_id"] == task_id for item in progress)
+        assert all(item["current_speed"] == 0.0 for item in progress)
+        assert all(item["current_files"] == [] for item in progress)
+    finally:
+        database.close()
+
+
+def test_task_control_publishes_file_progress_speed_and_current_file(tmp_path):
+    from src.pixiv_downloader.database import DatabaseManager
+    from src.pixiv_downloader.task_manager import TaskManager
+
+    database = DatabaseManager(tmp_path / "history.db")
+    events = []
+    ticks = iter([0.0, 0.0, 1.0, 2.0, 3.0])
+
+    def execute(task, control):
+        control.set_total(2)
+        control.file_progress("作品.jpg", 0, 10, False)
+        control.file_progress("作品.jpg", 5, 10, False)
+        control.file_progress("作品.jpg", 10, 10, True)
+
+    try:
+        manager = TaskManager(
+            database,
+            execute,
+            publish=lambda event, payload: events.append((event, payload)),
+            clock=lambda: next(ticks),
+        )
+        task_id = manager.create_task(task_type="artist", query={"artist_id": 456})
+
+        manager.start_task(task_id)
+
+        file_updates = [
+            payload
+            for event, payload in events
+            if event == "progress_update" and payload["current_files"]
+        ]
+        assert [item["current_files"] for item in file_updates] == [
+            [{"filename": "作品.jpg", "progress": 0}],
+            [{"filename": "作品.jpg", "progress": 50}],
+            [{"filename": "作品.jpg", "progress": 100}],
+        ]
+        assert file_updates[0]["current_speed"] == 0.0
+        assert file_updates[1]["current_speed"] == pytest.approx(5 / (1024 ** 2))
+        assert file_updates[2]["current_speed"] == pytest.approx(5 / (1024 ** 2))
+        assert all(item["eta_seconds"] is None for item in file_updates)
+        assert all(len(item["current_files"]) <= 5 for item in file_updates)
+    finally:
+        database.close()
+
+
+def test_task_control_throttles_all_progress_updates_to_once_per_second(tmp_path):
+    from src.pixiv_downloader.database import DatabaseManager
+    from src.pixiv_downloader.task_manager import TaskManager
+
+    database = DatabaseManager(tmp_path / "history.db")
+    events = []
+
+    def execute(task, control):
+        control.set_total(1)
+        control.file_progress("作品.jpg", 0, 10, False)
+        control.file_progress("作品.jpg", 10, 10, True)
+        control.record_result("downloaded")
+
+    try:
+        manager = TaskManager(
+            database,
+            execute,
+            publish=lambda event, payload: events.append((event, payload)),
+            clock=lambda: 0.0,
+        )
+        task_id = manager.create_task(task_type="artist", query={"artist_id": 456})
+
+        manager.start_task(task_id)
+
+        assert [event for event, _ in events].count("progress_update") == 1
+        assert [event for event, _ in events].count("task_complete") == 1
+    finally:
+        database.close()
+
+
+def test_task_control_estimates_eta_from_completed_item_rate(tmp_path):
+    from src.pixiv_downloader.database import DatabaseManager
+    from src.pixiv_downloader.task_manager import TaskManager
+
+    database = DatabaseManager(tmp_path / "history.db")
+    events = []
+    ticks = iter([0.0, 0.0, 2.0, 4.0])
+
+    def execute(task, control):
+        control.set_total(2)
+        control.record_result("downloaded")
+        control.record_result("skipped")
+
+    try:
+        manager = TaskManager(
+            database,
+            execute,
+            publish=lambda event, payload: events.append((event, payload)),
+            clock=lambda: next(ticks),
+        )
+        task_id = manager.create_task(task_type="artist", query={"artist_id": 456})
+
+        manager.start_task(task_id)
+
+        result_updates = [
+            payload
+            for event, payload in events
+            if event == "progress_update"
+            and payload["downloaded_count"] + payload["skipped_count"] > 0
+        ]
+        assert [item["eta_seconds"] for item in result_updates] == [2.0, 0.0]
+    finally:
+        database.close()
+
+
+def test_task_manager_publishes_cancelled_terminal_event(tmp_path):
+    from src.pixiv_downloader.database import DatabaseManager
+    from src.pixiv_downloader.task_manager import TaskManager
+
+    database = DatabaseManager(tmp_path / "history.db")
+    events = []
+    manager = None
+    task_id = None
+
+    def execute(task, control):
+        manager.cancel_task(task_id)
+        assert control.checkpoint() is False
+
+    def publish(event, payload):
+        events.append((event, payload, database.get_task(payload["task_id"])["status"]))
+
+    try:
+        manager = TaskManager(database, execute, publish=publish)
+        task_id = manager.create_task(task_type="artist", query={"artist_id": 456})
+
+        manager.start_task(task_id)
+
+        terminal = [entry for entry in events if entry[0] == "task_complete"]
+        assert len(terminal) == 1
+        assert terminal[0][1]["task_id"] == task_id
+        assert terminal[0][1]["status"] == "cancelled"
+        assert terminal[0][2] == "cancelled"
+    finally:
+        database.close()
+
+
 def test_task_manager_pause_and_resume_at_checkpoint(tmp_path):
     from src.pixiv_downloader.database import DatabaseManager
     from src.pixiv_downloader.task_manager import TaskManager

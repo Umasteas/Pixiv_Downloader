@@ -28,6 +28,7 @@ class FakeResponse:
     def __init__(self, payload=b"jpeg-bytes"):
         self.payload = payload
         self.content = self
+        self.content_length = len(payload)
 
     async def __aenter__(self):
         return self
@@ -60,6 +61,42 @@ class FakeSession:
     def get(self, url, **kwargs):
         self.get_calls.append((url, kwargs))
         return FakeResponse()
+
+
+@pytest.mark.asyncio
+async def test_download_file_reports_streaming_byte_progress(tmp_path):
+    from src.pixiv_downloader.downloader import ArtistDownloader
+
+    class Proxy:
+        def aiohttp_options(self):
+            return {}, {}
+
+    FakeSession.instances.clear()
+    updates = []
+    downloader = ArtistDownloader(
+        api=object(),
+        database=object(),
+        proxy_manager=Proxy(),
+        output_dir=tmp_path,
+        session_factory=FakeSession,
+    )
+    save_path = tmp_path / "作品.jpg"
+
+    await downloader.download_file(
+        "https://i.pximg.net/example.jpg",
+        save_path,
+        progress=lambda filename, downloaded, total, complete: updates.append(
+            (filename, downloaded, total, complete)
+        ),
+    )
+
+    assert updates == [
+        ("作品.jpg", 0, 10, False),
+        ("作品.jpg", 4, 10, False),
+        ("作品.jpg", 10, 10, False),
+        ("作品.jpg", 10, 10, True),
+    ]
+    assert save_path.read_bytes() == b"jpeg-bytes"
 
 
 @pytest.mark.asyncio
@@ -252,6 +289,7 @@ async def test_artist_download_resumes_from_checkpoint_and_records_task_progress
             self.checkpoints = 0
             self.results = []
             self.totals = []
+            self.file_updates = []
 
         def set_total(self, total):
             self.totals.append(total)
@@ -262,6 +300,9 @@ async def test_artist_download_resumes_from_checkpoint_and_records_task_progress
 
         def record_result(self, result):
             self.results.append(result)
+
+        def file_progress(self, filename, downloaded, total, complete):
+            self.file_updates.append((filename, downloaded, total, complete))
 
     database = Database()
     control = Control()
@@ -286,6 +327,13 @@ async def test_artist_download_resumes_from_checkpoint_and_records_task_progress
     assert control.results == ["downloaded"]
     assert [call[0] for call in database.mark_calls] == [2]
     assert database.mark_calls[0][1]["task_id"] == 77
+    assert [update[1:] for update in control.file_updates] == [
+        (0, 10, False),
+        (4, 10, False),
+        (10, 10, False),
+        (10, 10, True),
+    ]
+    assert all(update[0].endswith(".jpg") for update in control.file_updates)
 
 
 @pytest.mark.asyncio

@@ -85,7 +85,16 @@ def _execute_download_task(task, control):
     asyncio.run(operation)
 
 
-task_manager = TaskManager(database_manager, _execute_download_task)
+def _publish_task_event(event, payload):
+    """从后台任务线程广播本机单用户任务事件。"""
+    socketio.emit(event, payload)
+
+
+task_manager = TaskManager(
+    database_manager,
+    _execute_download_task,
+    publish=_publish_task_event,
+)
 
 # 生成随机 token 用于 URL
 SECURITY_TOKEN = secrets.token_urlsafe(16)

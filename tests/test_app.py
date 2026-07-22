@@ -51,6 +51,51 @@ def test_socketio_is_integrated_and_accepts_a_test_client():
         client.disconnect()
 
 
+def test_task_event_publisher_reaches_socketio_test_client():
+    client = app_module.socketio.test_client(app_module.app)
+    payload = {
+        "task_id": 7,
+        "total_count": 2,
+        "downloaded_count": 1,
+        "skipped_count": 0,
+        "failed_count": 0,
+        "current_speed": 1.25,
+        "eta_seconds": 3.0,
+        "current_files": [{"filename": "作品.jpg", "progress": 50}],
+    }
+    try:
+        app_module.task_manager.publish("progress_update", payload)
+
+        assert client.get_received() == [{
+            "name": "progress_update",
+            "args": [payload],
+            "namespace": "/",
+        }]
+    finally:
+        client.disconnect()
+
+
+def test_frontend_declares_live_task_progress_contract():
+    response = app_module.app.test_client().get("/static/app.js")
+
+    assert response.status_code == 200
+    script = response.get_data(as_text=True)
+    for event in ("progress_update", "task_complete", "error"):
+        assert f"socket.on('{event}'" in script
+    for marker in (
+        "liveTaskProgress",
+        "progress-bar",
+        "aria-valuenow",
+        "current_speed",
+        "eta_seconds",
+        "current_files",
+        "下载",
+        "跳过",
+        "失败",
+    ):
+        assert marker in script
+
+
 def _stub_successful_connectivity(monkeypatch):
     class StubProxyManager:
         async def test_connection(self, values=None):

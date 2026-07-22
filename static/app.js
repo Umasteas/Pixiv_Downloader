@@ -160,6 +160,8 @@ if (proxyForm && proxyTest) {
 
 const taskList = document.getElementById('task-list');
 const taskListFeedback = document.getElementById('task-list-feedback');
+const liveTaskProgress = new Map();
+let renderedTasks = [];
 const taskStatusLabels = {
     pending: '等待中', running: '运行中', paused: '已暂停', completed: '已完成',
     cancelled: '已取消', failed: '失败',
@@ -169,8 +171,14 @@ const taskActions = {
     running: [['pause', '暂停'], ['cancel', '取消']],
     paused: [['resume', '恢复'], ['cancel', '取消']],
 };
+const formatEta = (seconds) => {
+    if (seconds === null || seconds === undefined) return '待计算';
+    const rounded = Math.max(0, Math.ceil(seconds));
+    return rounded < 60 ? `${rounded} 秒` : `${Math.floor(rounded / 60)} 分 ${rounded % 60} 秒`;
+};
 
 const renderTasks = (tasks) => {
+    renderedTasks = tasks;
     taskList.replaceChildren();
     if (!tasks.length) {
         const empty = document.createElement('p');
@@ -179,14 +187,19 @@ const renderTasks = (tasks) => {
         taskList.append(empty);
         return;
     }
-    tasks.forEach((task) => {
+    tasks.forEach((storedTask) => {
+        const task = { ...storedTask, ...(liveTaskProgress.get(storedTask.task_id) || {}) };
         const processed = task.downloaded_count + task.skipped_count + task.failed_count;
         const total = task.total_count ?? '待获取';
+        const percent = task.total_count ? Math.min(100, Math.round(processed * 100 / task.total_count)) : 0;
         const card = document.createElement('div');
-        card.className = 'border rounded p-3 d-flex flex-wrap justify-content-between gap-3';
+        card.className = 'border rounded p-3';
+        card.dataset.taskCard = task.task_id;
+        const header = document.createElement('div');
+        header.className = 'd-flex flex-wrap justify-content-between gap-3';
         const summary = document.createElement('div');
         const artistId = task.query?.artist_id;
-        summary.textContent = `#${task.task_id} · ${artistId ? `画师 ${artistId}` : task.task_type} · ${taskStatusLabels[task.status] || task.status} · 进度 ${processed}/${total} · 下载 ${task.downloaded_count} / 跳过 ${task.skipped_count} / 失败 ${task.failed_count}`;
+        summary.textContent = `#${task.task_id} · ${artistId ? `画师 ${artistId}` : task.task_type} · ${taskStatusLabels[task.status] || task.status}`;
         const controls = document.createElement('div');
         controls.className = 'd-flex gap-2';
         (taskActions[task.status] || []).forEach(([action, label]) => {
@@ -198,7 +211,30 @@ const renderTasks = (tasks) => {
             button.textContent = label;
             controls.append(button);
         });
-        card.append(summary, controls);
+        header.append(summary, controls);
+        const progress = document.createElement('div');
+        progress.className = 'progress mt-3';
+        progress.setAttribute('role', 'progressbar');
+        progress.setAttribute('aria-label', `任务 ${task.task_id} 下载进度`);
+        progress.setAttribute('aria-valuemin', '0');
+        progress.setAttribute('aria-valuemax', '100');
+        progress.setAttribute('aria-valuenow', String(percent));
+        const bar = document.createElement('div');
+        bar.className = 'progress-bar';
+        bar.style.width = `${percent}%`;
+        bar.textContent = `${percent}%`;
+        progress.append(bar);
+        const metrics = document.createElement('div');
+        metrics.className = 'small text-muted mt-2';
+        metrics.textContent = `进度 ${processed}/${total} · 下载 ${task.downloaded_count} / 跳过 ${task.skipped_count} / 失败 ${task.failed_count} · 速度 ${Number(task.current_speed || 0).toFixed(2)} MB/s · 剩余 ${formatEta(task.eta_seconds)}`;
+        const files = document.createElement('ul');
+        files.className = 'list-unstyled small mb-0 mt-2';
+        (task.current_files || []).slice(0, 5).forEach((file) => {
+            const item = document.createElement('li');
+            item.textContent = `${file.filename} · ${file.progress}%`;
+            files.append(item);
+        });
+        card.append(header, progress, metrics, files);
         taskList.append(card);
     });
 };
@@ -216,6 +252,32 @@ const loadTasks = async () => {
         taskListFeedback.textContent = error.message;
     }
 };
+
+const applyLiveTaskEvent = (payload) => {
+    liveTaskProgress.set(payload.task_id, {
+        ...(liveTaskProgress.get(payload.task_id) || {}),
+        ...payload,
+    });
+    if (taskList && renderedTasks.some((task) => task.task_id === payload.task_id)) {
+        renderTasks(renderedTasks);
+    } else {
+        loadTasks();
+    }
+};
+
+socket.on('progress_update', applyLiveTaskEvent);
+socket.on('task_complete', (payload) => {
+    applyLiveTaskEvent({ ...payload, current_files: [], current_speed: 0, eta_seconds: 0 });
+    loadTasks();
+});
+socket.on('error', (payload) => {
+    applyLiveTaskEvent({ ...payload, current_files: [], current_speed: 0 });
+    if (taskListFeedback) {
+        taskListFeedback.className = 'alert alert-danger mt-3';
+        taskListFeedback.textContent = payload.message || '任务执行失败。';
+    }
+    loadTasks();
+});
 
 if (taskList) {
     document.getElementById('task-refresh').addEventListener('click', loadTasks);
