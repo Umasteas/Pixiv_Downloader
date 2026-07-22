@@ -403,7 +403,10 @@ if (followCheckButton && followArtworkGroups) {
                 const bookmarks = document.createElement('small');
                 bookmarks.className = 'd-block text-muted';
                 bookmarks.textContent = `收藏 ${artwork.bookmarks || 0}`;
-                details.append(artworkTitle, bookmarks);
+                const pages = document.createElement('small');
+                pages.className = 'd-block text-muted';
+                pages.textContent = artwork.page_count > 1 ? `共 ${artwork.page_count} 页` : '';
+                details.append(artworkTitle, pages, bookmarks);
                 row.append(checkbox, image, details);
                 section.appendChild(row);
             });

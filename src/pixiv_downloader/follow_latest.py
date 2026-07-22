@@ -3,6 +3,8 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
+from .downloader import parse_page_count
+
 
 def _field(value: Any, name: str, default=None):
     if isinstance(value, dict):
@@ -157,6 +159,7 @@ class FollowLatestScanner:
             "title": str(_field(artwork, "title", "")),
             "thumbnail_url": str(thumbnail),
             "bookmarks": int(_field(artwork, "total_bookmarks", 0) or 0),
+            "page_count": parse_page_count(artwork),
         }
 
     @staticmethod

@@ -77,7 +77,7 @@ def test_fetch_follow_latest_detects_new_artworks_and_updates_state(tmp_path):
             if user_id == 10:
                 return {
                     "illusts": [
-                        follow_artwork(203, 10, "画师 A", 900),
+                        follow_artwork(203, 10, "画师 A", 900, page_count=3),
                         follow_artwork(202, 10, "画师 A", 600),
                         follow_artwork(200, 10, "画师 A", 100),
                     ],
@@ -114,6 +114,7 @@ def test_fetch_follow_latest_detects_new_artworks_and_updates_state(tmp_path):
         "title": "作品 203",
         "thumbnail_url": "https://i.pximg.net/c/203.jpg",
         "bookmarks": 900,
+        "page_count": 3,
     }
     assert [item["artwork_id"] for item in result["artists"][1]["artworks"]] == [50, 49]
     assert result["artists"][2]["artworks"] == []
@@ -133,12 +134,13 @@ def test_fetch_follow_latest_detects_new_artworks_and_updates_state(tmp_path):
     database.close()
 
 
-def follow_artwork(artwork_id, artist_id, artist_name, bookmarks):
+def follow_artwork(artwork_id, artist_id, artist_name, bookmarks, *, page_count=1):
     return {
         "id": artwork_id,
         "title": f"作品 {artwork_id}",
         "user": {"id": artist_id, "name": artist_name},
         "total_bookmarks": bookmarks,
+        "page_count": page_count,
         "image_urls": {"square_medium": f"https://i.pximg.net/c/{artwork_id}.jpg"},
     }
 
@@ -170,6 +172,19 @@ def test_selected_follow_artworks_create_pending_task(tmp_path):
         }
     finally:
         database.close()
+
+
+def test_follow_public_artwork_rejects_invalid_page_count():
+    import pytest
+    from src.pixiv_downloader.downloader import DownloadError
+    from src.pixiv_downloader.follow_latest import FollowLatestScanner
+
+    with pytest.raises(DownloadError, match="page_count"):
+        FollowLatestScanner._public_artwork(
+            follow_artwork(203, 10, "画师 A", 900, page_count=0),
+            10,
+            "画师 A",
+        )
 
 
 def test_follow_latest_api_task_creation_and_frontend(monkeypatch):
@@ -245,6 +260,9 @@ def test_follow_latest_api_task_creation_and_frontend(monkeypatch):
     assert "/api/follow/download" in script
     assert "thumbnail_url" in script
     assert "bookmarks" in script
+    assert "artwork.page_count" in script
+    assert "共 ${artwork.page_count} 页" in script
+    assert "多图作品会自动跳过" not in page
 
 
 def test_follow_scan_failure_does_not_advance_partial_checkpoints(tmp_path):

@@ -105,7 +105,15 @@ async def test_artist_download_integration_uses_proxy_metadata_and_dedup(tmp_pat
 
     single = artwork()
     duplicate = artwork(id=124, title="已下载")
-    multiple = artwork(id=125, page_count=2)
+    multiple = artwork(
+        id=125,
+        title="多图作品",
+        page_count=2,
+        meta_pages=[
+            {"image_urls": {"original": "https://i.pximg.net/multi_p0.jpg"}},
+            {"image_urls": {"original": "https://i.pximg.net/multi_p1.png"}},
+        ],
+    )
 
     class FakeApi:
         def __init__(self):
@@ -147,7 +155,7 @@ async def test_artist_download_integration_uses_proxy_metadata_and_dedup(tmp_pat
 
     result = await downloader.download_artist(456)
 
-    assert result == {"total": 3, "downloaded": 1, "skipped": 2, "failed": 0}
+    assert result == {"total": 3, "downloaded": 2, "skipped": 1, "failed": 0}
     assert proxy.calls == 1
     assert api.calls == [(456, {})]
     assert len(FakeSession.instances) == 1
@@ -160,7 +168,21 @@ async def test_artist_download_integration_uses_proxy_metadata_and_dedup(tmp_pat
                 "proxy": "http://proxy.test:8080",
                 "headers": {"Referer": "https://app-api.pixiv.net/"},
             },
-        )
+        ),
+        (
+            "https://i.pximg.net/multi_p0.jpg",
+            {
+                "proxy": "http://proxy.test:8080",
+                "headers": {"Referer": "https://app-api.pixiv.net/"},
+            },
+        ),
+        (
+            "https://i.pximg.net/multi_p1.png",
+            {
+                "proxy": "http://proxy.test:8080",
+                "headers": {"Referer": "https://app-api.pixiv.net/"},
+            },
+        ),
     ]
 
     image_path = tmp_path / "artists" / "画师_名称_456" / "123_画师_名称_标题_________.jpg"
@@ -178,6 +200,243 @@ async def test_artist_download_integration_uses_proxy_metadata_and_dedup(tmp_pat
     assert database.mark_calls[0][0] == 123
     assert database.mark_calls[0][1]["file_path"] == str(image_path)
     assert database.mark_calls[0][1]["file_size"] == len(b"jpeg-bytes")
+    multi_dir = tmp_path / "artists" / "画师_名称_456" / "125_多图作品"
+    assert (multi_dir / "p0.jpg").exists()
+    assert (multi_dir / "p1.png").exists()
+    assert json.loads((multi_dir / "metadata.json").read_text(encoding="utf-8"))["page_count"] == 2
+    assert [call[0] for call in database.mark_calls] == [123, 125]
+    assert [call[1]["page_count"] for call in database.mark_calls] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_multi_page_artwork_downloads_all_pages_metadata_and_database(tmp_path):
+    from src.pixiv_downloader.downloader import ArtistDownloader
+
+    candidate = artwork(
+        id=222,
+        title="多图:作品",
+        page_count=3,
+        meta_pages=[
+            {"image_urls": {"original": "https://i.pximg.net/work_p0.jpg"}},
+            {"image_urls": {"original": "https://i.pximg.net/work_p1.png"}},
+            {"image_urls": {"original": "https://i.pximg.net/work_p2.gif"}},
+        ],
+    )
+
+    class Database:
+        def __init__(self):
+            self.mark_calls = []
+
+        def is_downloaded(self, artwork_id):
+            return False
+
+        def mark_as_downloaded(self, artwork_id, **kwargs):
+            self.mark_calls.append((artwork_id, kwargs))
+
+    database = Database()
+    session = FakeSession()
+    downloader = ArtistDownloader(
+        api=object(),
+        database=database,
+        proxy_manager=object(),
+        output_dir=tmp_path,
+    )
+
+    status = await downloader.download_artwork(
+        candidate,
+        session=session,
+        request_options={},
+        task_id=91,
+    )
+
+    artwork_dir = tmp_path / "artists" / "画师_名称_456" / "222_多图_作品"
+    assert status == "downloaded"
+    assert [call[0] for call in session.get_calls] == [
+        "https://i.pximg.net/work_p0.jpg",
+        "https://i.pximg.net/work_p1.png",
+        "https://i.pximg.net/work_p2.gif",
+    ]
+    assert (artwork_dir / "p0.jpg").read_bytes() == b"jpeg-bytes"
+    assert (artwork_dir / "p1.png").read_bytes() == b"jpeg-bytes"
+    assert (artwork_dir / "p2.gif").read_bytes() == b"jpeg-bytes"
+    metadata = json.loads((artwork_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["page_count"] == 3
+    assert metadata["download_info"]["file_path"] == str(artwork_dir)
+    assert database.mark_calls == [(222, {
+        "artist_id": 456,
+        "artist_name": "画师:名称",
+        "title": "多图:作品",
+        "file_path": str(artwork_dir),
+        "file_size": len(b"jpeg-bytes") * 3,
+        "page_count": 3,
+        "bookmarks": 789,
+        "tags": ["风景", "原创"],
+        "task_id": 91,
+    })]
+    assert list(artwork_dir.glob("*.part")) == []
+
+
+@pytest.mark.asyncio
+async def test_multi_page_artwork_persists_real_database_record(tmp_path):
+    from src.pixiv_downloader.database import DatabaseManager
+    from src.pixiv_downloader.downloader import ArtistDownloader
+
+    candidate = artwork(
+        id=224,
+        title="真实数据库",
+        page_count=2,
+        meta_pages=[
+            {"image_urls": {"original": "https://i.pximg.net/db_p0.jpg"}},
+            {"image_urls": {"original": "https://i.pximg.net/db_p1.png"}},
+        ],
+    )
+    database = DatabaseManager(tmp_path / "history.db")
+    try:
+        downloader = ArtistDownloader(object(), database, object(), output_dir=tmp_path)
+        status = await downloader.download_artwork(
+            candidate,
+            session=FakeSession(),
+            request_options={},
+        )
+        row = dict(database.connection.execute(
+            "SELECT * FROM downloads WHERE artwork_id = 224"
+        ).fetchone())
+
+        assert status == "downloaded"
+        assert database.is_downloaded(224)
+        assert row["page_count"] == 2
+        assert row["file_size"] == len(b"jpeg-bytes") * 2
+        assert Path(row["file_path"]).name == "224_真实数据库"
+        assert json.loads(row["tags"]) == ["风景", "原创"]
+    finally:
+        database.close()
+
+
+@pytest.mark.asyncio
+async def test_multi_page_failure_defers_metadata_and_retry_skips_completed_pages(tmp_path):
+    from src.pixiv_downloader.downloader import ArtistDownloader
+
+    candidate = artwork(
+        id=223,
+        title="续传作品",
+        page_count=3,
+        meta_pages=[
+            {"image_urls": {"original": f"https://i.pximg.net/retry_p{index}.jpg"}}
+            for index in range(3)
+        ],
+    )
+
+    class Database:
+        def __init__(self):
+            self.mark_calls = []
+
+        def is_downloaded(self, artwork_id):
+            return False
+
+        def mark_as_downloaded(self, artwork_id, **kwargs):
+            self.mark_calls.append((artwork_id, kwargs))
+
+    class FailingSession(FakeSession):
+        def get(self, url, **kwargs):
+            self.get_calls.append((url, kwargs))
+            if url.endswith("p1.jpg"):
+                raise RuntimeError("第二页失败")
+            return FakeResponse()
+
+    database = Database()
+    downloader = ArtistDownloader(object(), database, object(), output_dir=tmp_path)
+    first_session = FailingSession()
+
+    with pytest.raises(RuntimeError, match="第二页失败"):
+        await downloader.download_artwork(
+            candidate,
+            session=first_session,
+            request_options={},
+        )
+
+    artwork_dir = tmp_path / "artists" / "画师_名称_456" / "223_续传作品"
+    assert (artwork_dir / "p0.jpg").exists()
+    assert not (artwork_dir / "p1.jpg").exists()
+    assert not (artwork_dir / "metadata.json").exists()
+    assert database.mark_calls == []
+
+    retry_session = FakeSession()
+    assert await downloader.download_artwork(
+        candidate,
+        session=retry_session,
+        request_options={},
+    ) == "downloaded"
+    assert [call[0] for call in retry_session.get_calls] == [
+        "https://i.pximg.net/retry_p1.jpg",
+        "https://i.pximg.net/retry_p2.jpg",
+    ]
+    assert (artwork_dir / "metadata.json").exists()
+    assert database.mark_calls[0][1]["page_count"] == 3
+
+
+@pytest.mark.parametrize("invalid_page_count", [0, -1, 1.5, "2", True, None])
+def test_invalid_page_count_is_rejected(invalid_page_count):
+    from src.pixiv_downloader.downloader import ArtistDownloader, DownloadError
+
+    candidate = artwork(page_count=invalid_page_count)
+    with pytest.raises(DownloadError, match="page_count"):
+        ArtistDownloader._original_image_urls(candidate)
+
+
+def test_missing_page_count_remains_single_page_compatible():
+    from src.pixiv_downloader.downloader import ArtistDownloader
+
+    candidate = artwork()
+    candidate.pop("page_count")
+    assert ArtistDownloader._original_image_urls(candidate) == [
+        "https://i.pximg.net/img-original/example.jpg"
+    ]
+
+
+def test_page_count_validation_supports_pixiv_api_objects():
+    from types import SimpleNamespace
+    from src.pixiv_downloader.downloader import ArtistDownloader, DownloadError
+
+    candidate = SimpleNamespace(
+        page_count=2,
+        meta_pages=[
+            SimpleNamespace(image_urls=SimpleNamespace(original="https://i.pximg.net/object_p0.jpg")),
+            SimpleNamespace(image_urls=SimpleNamespace(original="https://i.pximg.net/object_p1.png")),
+        ],
+    )
+    assert ArtistDownloader._original_image_urls(candidate) == [
+        "https://i.pximg.net/object_p0.jpg",
+        "https://i.pximg.net/object_p1.png",
+    ]
+    with pytest.raises(DownloadError, match="page_count"):
+        ArtistDownloader._original_image_urls(SimpleNamespace(page_count=-1))
+
+
+@pytest.mark.asyncio
+async def test_single_page_database_failure_rolls_back_metadata(tmp_path):
+    from src.pixiv_downloader.downloader import ArtistDownloader
+
+    class FailingDatabase:
+        def is_downloaded(self, artwork_id):
+            return False
+
+        def mark_as_downloaded(self, artwork_id, **kwargs):
+            raise RuntimeError("database unavailable")
+
+    downloader = ArtistDownloader(object(), FailingDatabase(), object(), output_dir=tmp_path)
+    candidate = artwork(id=225, title="单图回滚")
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        await downloader.download_artwork(
+            candidate,
+            session=FakeSession(),
+            request_options={},
+        )
+
+    image_path = tmp_path / "artists" / "画师_名称_456" / "225_画师_名称_单图回滚.jpg"
+    assert image_path.exists()
+    assert not image_path.with_suffix(".metadata.json").exists()
+    assert not image_path.with_suffix(".metadata.json.part").exists()
 
 
 def test_fetch_artist_artworks_follows_pixiv_pagination_without_duplicate_user_id(tmp_path):
@@ -498,3 +757,65 @@ def test_file_organization_and_safe_naming(tmp_path):
     assert windows_units(emoji_path.parent.name) <= 200
     assert windows_units(emoji_path.name) <= 200
     assert windows_units(metadata_path_for(emoji_path).name) <= 200
+
+
+def test_multi_page_metadata_path_respects_complete_windows_budget(monkeypatch):
+    from pathlib import Path
+    from src.pixiv_downloader.file_organizer import get_artwork_directory
+
+    monkeypatch.setattr(Path, "mkdir", lambda self, **kwargs: None)
+    candidate = {
+        "id": 123,
+        "title": "😀" * 300,
+        "user": {"id": 456, "name": "画师"},
+    }
+    artwork_dir = get_artwork_directory(Path("C:/p/review"), candidate)
+    metadata_path = artwork_dir / "metadata.json"
+    windows_units = len(str(metadata_path).encode("utf-16-le")) // 2
+
+    assert windows_units <= 240
+
+
+def test_multi_page_urls_directory_and_page_paths(tmp_path):
+    from src.pixiv_downloader.downloader import ArtistDownloader
+    from src.pixiv_downloader.file_organizer import (
+        get_artwork_directory,
+        get_page_save_path,
+    )
+
+    candidate = artwork(
+        page_count=3,
+        meta_pages=[
+            {"image_urls": {"original": "https://i.pximg.net/work_p0.jpg?token=x"}},
+            {"image_urls": {"original": "https://i.pximg.net/work_p1.png"}},
+            {"image_urls": {"original": "https://i.pximg.net/work_p2.bin"}},
+        ],
+    )
+
+    urls = ArtistDownloader._original_image_urls(candidate)
+    artwork_dir = get_artwork_directory(tmp_path, candidate)
+
+    assert urls == [
+        "https://i.pximg.net/work_p0.jpg?token=x",
+        "https://i.pximg.net/work_p1.png",
+        "https://i.pximg.net/work_p2.bin",
+    ]
+    assert artwork_dir == tmp_path / "artists" / "画师_名称_456" / "123_标题_________"
+    assert get_page_save_path(artwork_dir, 0, urls[0]).name == "p0.jpg"
+    assert get_page_save_path(artwork_dir, 1, urls[1]).name == "p1.png"
+    assert get_page_save_path(artwork_dir, 2, urls[2]).name == "p2.jpg"
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        artwork(page_count=2, meta_pages=[]),
+        artwork(page_count=2, meta_pages=[{"image_urls": {"original": "https://i.pximg.net/p0.jpg"}}]),
+        artwork(page_count=2, meta_pages=[{"image_urls": {}}, {"image_urls": {"original": "https://i.pximg.net/p1.jpg"}}]),
+    ],
+)
+def test_multi_page_urls_require_complete_original_page_list(candidate):
+    from src.pixiv_downloader.downloader import ArtistDownloader, DownloadError
+
+    with pytest.raises(DownloadError, match="多图原图地址"):
+        ArtistDownloader._original_image_urls(candidate)

@@ -7,7 +7,12 @@ from urllib.parse import parse_qs, urlparse
 
 import aiohttp
 
-from .file_organizer import get_save_path, metadata_path_for
+from .file_organizer import (
+    get_artwork_directory,
+    get_page_save_path,
+    get_save_path,
+    metadata_path_for,
+)
 
 
 def _field(value: Any, name: str, default=None):
@@ -17,7 +22,15 @@ def _field(value: Any, name: str, default=None):
 
 
 class DownloadError(RuntimeError):
-    """作品数据或文件下载失败。"""
+    """作品或文件下载失败。"""
+
+
+def parse_page_count(artwork: Any) -> int:
+    """读取 Pixiv 页数；缺失字段兼容单图，显式非法值一律拒绝。"""
+    page_count = _field(artwork, "page_count", 1)
+    if type(page_count) is not int or page_count < 1:
+        raise DownloadError("page_count 必须是大于等于 1 的整数")
+    return page_count
 
 
 class ArtistDownloader:
@@ -122,43 +135,64 @@ class ArtistDownloader:
         task_id: int | None = None,
         progress: Callable[[str, int, int | None, bool], None] | None = None,
     ) -> str:
-        """下载一个未下载的单图作品并记录元数据和数据库历史。"""
+        """下载一个未下载作品，并记录元数据和数据库历史。"""
         artwork_id = int(_field(artwork, "id"))
-        if int(_field(artwork, "page_count", 1)) != 1:
-            return "skipped"
+        page_count = parse_page_count(artwork)
         if self.database.is_downloaded(artwork_id):
             return "skipped"
 
-        save_path = get_save_path(self.output_dir, artwork)
-        image_url = self._original_image_url(artwork)
-        await self.download_file(
-            image_url,
-            save_path,
-            session=session,
-            request_options=request_options,
-            progress=progress,
-        )
+        if page_count > 1:
+            urls = self._original_image_urls(artwork)
+            save_path = get_artwork_directory(self.output_dir, artwork)
+            page_paths = [
+                get_page_save_path(save_path, index, url)
+                for index, url in enumerate(urls)
+            ]
+            for url, page_path in zip(urls, page_paths):
+                if page_path.exists():
+                    continue
+                await self.download_file(
+                    url,
+                    page_path,
+                    session=session,
+                    request_options=request_options,
+                    progress=progress,
+                )
+            metadata_path = save_path / "metadata.json"
+            file_size = sum(path.stat().st_size for path in page_paths)
+        else:
+            save_path = get_save_path(self.output_dir, artwork)
+            image_url = self._original_image_url(artwork)
+            await self.download_file(
+                image_url,
+                save_path,
+                session=session,
+                request_options=request_options,
+                progress=progress,
+            )
+            metadata_path = metadata_path_for(save_path)
+            file_size = save_path.stat().st_size
 
         metadata = self._metadata(artwork, save_path)
-        metadata_path_for(save_path).write_text(
-            json.dumps(metadata, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        self._write_metadata(metadata_path, metadata)
         user = _field(artwork, "user", {})
-        tags = metadata["tags"]
         record = {
             "artist_id": int(_field(user, "id")),
             "artist_name": str(_field(user, "name", "")),
             "title": str(_field(artwork, "title", "")),
             "file_path": str(save_path),
-            "file_size": save_path.stat().st_size,
-            "page_count": 1,
+            "file_size": file_size,
+            "page_count": page_count,
             "bookmarks": int(_field(artwork, "total_bookmarks", 0) or 0),
-            "tags": tags,
+            "tags": metadata["tags"],
         }
         if task_id is not None:
             record["task_id"] = task_id
-        self.database.mark_as_downloaded(artwork_id, **record)
+        try:
+            self.database.mark_as_downloaded(artwork_id, **record)
+        except Exception:
+            metadata_path.unlink(missing_ok=True)
+            raise
         return "downloaded"
 
     async def download_artist(
@@ -247,6 +281,35 @@ class ArtistDownloader:
         return str(url)
 
     @staticmethod
+    def _original_image_urls(artwork: Any) -> list[str]:
+        page_count = parse_page_count(artwork)
+        if page_count <= 1:
+            return [ArtistDownloader._original_image_url(artwork)]
+        pages = _field(artwork, "meta_pages", []) or []
+        if len(pages) != page_count:
+            raise DownloadError("多图原图地址数量与页数不一致")
+        urls = [
+            _field(_field(page, "image_urls", {}) or {}, "original")
+            for page in pages
+        ]
+        if any(not url for url in urls):
+            raise DownloadError("多图原图地址不完整")
+        return [str(url) for url in urls]
+
+    @staticmethod
+    def _write_metadata(path: Path, metadata: dict[str, Any]) -> None:
+        temporary = path.with_suffix(path.suffix + ".part")
+        try:
+            temporary.write_text(
+                json.dumps(metadata, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temporary.replace(path)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
+
+    @staticmethod
     def _metadata(artwork: Any, save_path: Path) -> dict[str, Any]:
         user = _field(artwork, "user", {})
         raw_tags = _field(artwork, "tags", []) or []
@@ -260,6 +323,7 @@ class ArtistDownloader:
             },
             "tags": tags,
             "bookmarks": int(_field(artwork, "total_bookmarks", 0) or 0),
+            "page_count": parse_page_count(artwork),
             "create_date": str(_field(artwork, "create_date", "")),
             "download_info": {
                 "source": "artist",
