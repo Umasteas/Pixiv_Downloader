@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, urlparse
 import aiohttp
 
 from .download_policy import DownloadPolicy
+from .filters import filter_artworks
 from .rate_limiter import AdaptiveLimiter
 
 from .file_organizer import (
@@ -287,9 +288,13 @@ class ArtistDownloader:
         task_id: int | None = None,
         start_index: int = 0,
         control=None,
+        filters: dict[str, Any] | None = None,
     ) -> dict[str, int]:
         """下载画师的全部单图，单个作品失败时继续后续作品。"""
-        artworks = self.fetch_artist_artworks(int(artist_id))
+        artworks = filter_artworks(
+            self.fetch_artist_artworks(int(artist_id)),
+            filters,
+        )
         return await self._download_items(
             artworks,
             lambda artwork: artwork,

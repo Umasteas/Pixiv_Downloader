@@ -176,6 +176,16 @@ const formatEta = (seconds) => {
     const rounded = Math.max(0, Math.ceil(seconds));
     return rounded < 60 ? `${rounded} 秒` : `${Math.floor(rounded / 60)} 分 ${rounded % 60} 秒`;
 };
+const filterLabels = {
+    illust: '插画', manga: '漫画', ugoira: '动图',
+    general: '全年龄', r18: 'R-18', r18g: 'R-18-G',
+};
+const formatFilterSummary = (filters) => {
+    if (!filters) return '';
+    const types = (filters.work_types || []).map((value) => filterLabels[value] || value).join('/');
+    const ratings = (filters.r18_modes || []).map((value) => filterLabels[value] || value).join('/');
+    return `筛选：${types || '全部类型'} · ${ratings || '全部分级'} · 收藏 ≥ ${Number(filters.min_bookmarks || 0)}`;
+};
 
 const renderTasks = (tasks) => {
     renderedTasks = tasks;
@@ -199,7 +209,8 @@ const renderTasks = (tasks) => {
         header.className = 'd-flex flex-wrap justify-content-between gap-3';
         const summary = document.createElement('div');
         const artistId = task.query?.artist_id;
-        summary.textContent = `#${task.task_id} · ${artistId ? `画师 ${artistId}` : task.task_type} · ${taskStatusLabels[task.status] || task.status}`;
+        const filterSummary = formatFilterSummary(task.filters);
+        summary.textContent = `#${task.task_id} · ${artistId ? `画师 ${artistId}` : task.task_type} · ${taskStatusLabels[task.status] || task.status}${filterSummary ? ` · ${filterSummary}` : ''}`;
         const controls = document.createElement('div');
         controls.className = 'd-flex gap-2';
         (taskActions[task.status] || []).forEach(([action, label]) => {
@@ -305,11 +316,23 @@ const artistDownloadForm = document.getElementById('artist-download-form');
 
 if (artistDownloadForm) {
     const artistIdInput = document.getElementById('artist-id');
+    const minBookmarksInput = document.getElementById('min-bookmarks');
     const submitButton = document.getElementById('artist-download-submit');
     const feedback = document.getElementById('artist-download-feedback');
+    const checkedValues = (name) => Array.from(
+        artistDownloadForm.querySelectorAll(`input[name="${name}"]:checked`),
+        (input) => input.value,
+    );
 
     artistDownloadForm.addEventListener('submit', async (event) => {
         event.preventDefault();
+        const workTypes = checkedValues('work-types');
+        const r18Modes = checkedValues('r18-modes');
+        if (!workTypes.length || !r18Modes.length) {
+            feedback.className = 'alert alert-danger mt-3';
+            feedback.textContent = '请至少选择一种作品类型和一个分级。';
+            return;
+        }
         submitButton.disabled = true;
         feedback.className = 'alert alert-info mt-3';
         feedback.textContent = '正在创建下载任务…';
@@ -321,6 +344,11 @@ if (artistDownloadForm) {
                 body: JSON.stringify({
                     task_type: 'artist',
                     query: { artist_id: Number(artistIdInput.value) },
+                    filters: {
+                        work_types: workTypes,
+                        r18_modes: r18Modes,
+                        min_bookmarks: Number(minBookmarksInput.value) || 0,
+                    },
                 }),
             });
             const payload = await response.json();

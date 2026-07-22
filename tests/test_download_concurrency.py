@@ -128,7 +128,10 @@ async def test_paused_control_checkpoint_does_not_block_event_loop(tmp_path):
 
     class Api:
         def user_illusts(self, artist_id, **kwargs):
-            return {"illusts": [{"id": 1}], "next_url": None}
+            return {
+                "illusts": [{"id": 1, "type": "illust", "x_restrict": 0}],
+                "next_url": None,
+            }
 
     class Proxy:
         def aiohttp_options(self):
@@ -163,6 +166,8 @@ async def test_artist_download_runs_files_concurrently_up_to_policy_limit(tmp_pa
     artworks = [
         {
             "id": number,
+            "type": "illust",
+            "x_restrict": 0,
             "title": f"work-{number}",
             "page_count": 1,
             "user": {"id": 9, "name": "artist"},

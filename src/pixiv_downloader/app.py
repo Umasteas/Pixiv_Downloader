@@ -13,6 +13,7 @@ from .download_policy import DownloadPolicy
 from .database import DatabaseManager
 from .downloader import ArtistDownloader
 from .follow_latest import FollowLatestError, FollowLatestScanner
+from .filters import FilterValidationError, normalize_filters
 from .proxy import ProxyConfigError, ProxyManager
 from .runtime import runtime_paths
 from .task_manager import TaskManager, TaskManagerError
@@ -43,6 +44,7 @@ def _execute_download_task(task, control):
         value = query.get("artist_id")
         if type(value) is not int or value <= 0:
             raise TaskManagerError("画师任务缺少有效 ID")
+        filters = normalize_filters(task.get("filters"))
     elif task_type == "follow_latest":
         value = query.get("artwork_ids")
         if (
@@ -81,7 +83,11 @@ def _execute_download_task(task, control):
         "control": control,
     }
     if task_type == "artist":
-        operation = downloader.download_artist(value, **options)
+        operation = downloader.download_artist(
+            value,
+            filters=filters,
+            **options,
+        )
     else:
         operation = downloader.download_artwork_ids(value, **options)
     asyncio.run(operation)
@@ -334,7 +340,18 @@ def create_task():
             "success": False,
             "error": "画师任务必须包含正整数 artist_id。",
         }), 400
-    task_id = task_manager.create_task(task_type="artist", query={"artist_id": artist_id})
+    try:
+        filters = normalize_filters(data.get("filters"))
+    except FilterValidationError:
+        return jsonify({
+            "success": False,
+            "error": "筛选条件无效。",
+        }), 400
+    task_id = task_manager.create_task(
+        task_type="artist",
+        query={"artist_id": artist_id},
+        filters=filters,
+    )
     return jsonify({"success": True, "task_id": task_id, "status": "pending"}), 201
 
 

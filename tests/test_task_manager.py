@@ -626,7 +626,15 @@ def test_task_api_and_frontend_controls(monkeypatch):
     assert cancelled.get_json()["task"]["status"] == "cancelled"
     assert calls == [
         "list",
-        ("create", {"task_type": "artist", "query": {"artist_id": 456}}),
+        ("create", {
+            "task_type": "artist",
+            "query": {"artist_id": 456},
+            "filters": {
+                "work_types": ["illust", "manga", "ugoira"],
+                "r18_modes": ["general", "r18", "r18g"],
+                "min_bookmarks": 0,
+            },
+        }),
         ("start", 9),
         ("pause", 9),
         ("resume", 9),

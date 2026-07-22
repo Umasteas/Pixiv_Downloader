@@ -8,6 +8,8 @@ import pytest
 def artwork(**overrides):
     value = {
         "id": 123,
+        "type": "illust",
+        "x_restrict": 0,
         "title": '标题:/\\*?"<>|',
         "page_count": 1,
         "user": {"id": 456, "name": "画师:名称"},
