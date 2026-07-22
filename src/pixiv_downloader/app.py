@@ -252,6 +252,21 @@ def create_follow_download_task():
     })
 
 
+@app.route('/api/stats', methods=['GET'])
+def get_download_stats():
+    """返回下载历史统计。"""
+    time_range = request.args.get("range", "all")
+    if time_range not in {"7", "30", "all"}:
+        return jsonify({
+            "success": False,
+            "error": "时间范围必须是 7、30 或 all。",
+        }), 400
+    return jsonify({
+        "success": True,
+        "stats": database_manager.get_download_stats(time_range),
+    })
+
+
 @app.route('/api/tasks', methods=['GET'])
 def get_tasks():
     """获取任务列表"""
@@ -296,7 +311,7 @@ def start_app(
     }
     print(connectivity_message)
     if not reachable:
-        print('Pixiv 当前不可达，请在设置页面配置代理后重试。')
+        print('无法连接到Pixiv，请在设置页面配置代理后重试。')
 
     if auth_manager.has_saved_token():
         try:

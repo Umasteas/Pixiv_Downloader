@@ -134,6 +134,7 @@ class ArtistDownloader:
             artist_name=str(_field(user, "name", "")),
             title=str(_field(artwork, "title", "")),
             file_path=str(save_path),
+            file_size=save_path.stat().st_size,
             page_count=1,
             bookmarks=int(_field(artwork, "total_bookmarks", 0) or 0),
             tags=tags,

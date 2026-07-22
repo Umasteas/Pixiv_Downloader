@@ -140,6 +140,7 @@ async def test_artist_download_integration_uses_proxy_metadata_and_dedup(tmp_pat
     assert metadata["download_info"]["file_path"] == str(image_path)
     assert database.mark_calls[0][0] == 123
     assert database.mark_calls[0][1]["file_path"] == str(image_path)
+    assert database.mark_calls[0][1]["file_size"] == len(b"jpeg-bytes")
 
 
 def test_fetch_artist_artworks_follows_pixiv_pagination_without_duplicate_user_id(tmp_path):

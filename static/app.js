@@ -316,3 +316,76 @@ if (followCheckButton && followArtworkGroups) {
         }
     });
 }
+
+const statsRange = document.getElementById('stats-range');
+
+if (statsRange) {
+    const feedback = document.getElementById('stats-feedback');
+    const charts = {};
+    const colors = ['#0d6efd', '#6f42c1', '#d63384', '#dc3545', '#fd7e14', '#198754', '#20c997', '#0dcaf0', '#6c757d', '#ffc107'];
+    const taskTypeLabels = {
+        artist: '画师',
+        search: '搜索',
+        ranking: '排行榜',
+        bookmarks: '收藏夹',
+        follow_latest: '关注新作',
+    };
+    const formatFileSize = (bytes) => {
+        if (!bytes) return '0 B';
+        const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+        const exponent = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+        return `${(bytes / (1024 ** exponent)).toFixed(exponent ? 1 : 0)} ${units[exponent]}`;
+    };
+    const renderChart = (name, canvasId, type, labels, values, label) => {
+        if (charts[name]) charts[name].destroy();
+        charts[name] = new Chart(document.getElementById(canvasId), {
+            type,
+            data: {
+                labels,
+                datasets: [{
+                    label,
+                    data: values,
+                    backgroundColor: type === 'line' ? 'rgba(13, 110, 253, 0.18)' : colors,
+                    borderColor: type === 'line' ? '#0d6efd' : colors,
+                    borderWidth: 1,
+                    fill: type === 'line',
+                    tension: 0.25,
+                }],
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: { legend: { display: type === 'pie' } },
+                scales: type === 'pie' ? {} : { y: { beginAtZero: true, ticks: { precision: 0 } } },
+            },
+        });
+    };
+    const renderStats = (stats) => {
+        document.getElementById('stats-total-downloads').textContent = String(stats.totals.downloads);
+        document.getElementById('stats-total-artists').textContent = String(stats.totals.artists);
+        document.getElementById('stats-total-size').textContent = formatFileSize(stats.totals.file_size);
+        renderChart('artists', 'stats-artists-chart', 'bar', stats.top_artists.map((item) => item.artist_name || String(item.artist_id)), stats.top_artists.map((item) => item.count), '下载数');
+        renderChart('tags', 'stats-tags-chart', 'bar', stats.top_tags.map((item) => item.tag), stats.top_tags.map((item) => item.count), '使用数');
+        renderChart('trend', 'stats-trend-chart', 'line', stats.trend.map((item) => item.date), stats.trend.map((item) => item.count), '下载数');
+        renderChart('types', 'stats-types-chart', 'pie', stats.task_types.map((item) => taskTypeLabels[item.task_type] || item.task_type), stats.task_types.map((item) => item.count), '任务数');
+    };
+    const loadStats = async () => {
+        feedback.className = 'alert alert-info mt-3';
+        feedback.textContent = '正在加载统计数据…';
+        try {
+            const response = await fetch(`/api/stats?range=${encodeURIComponent(statsRange.value)}`);
+            const payload = await response.json();
+            if (!response.ok) throw new Error(payload.error || '统计数据加载失败。');
+            if (typeof Chart === 'undefined') throw new Error('图表组件加载失败，请检查网络连接。');
+            renderStats(payload.stats);
+            feedback.className = 'alert alert-success mt-3 d-none';
+            feedback.textContent = '';
+        } catch (error) {
+            feedback.className = 'alert alert-danger mt-3';
+            feedback.textContent = error.message;
+        }
+    };
+
+    statsRange.addEventListener('change', loadStats);
+    loadStats();
+}

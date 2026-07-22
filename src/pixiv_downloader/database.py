@@ -2,6 +2,8 @@
 import json
 import sqlite3
 import threading
+from collections import Counter
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional, Union
 
@@ -30,6 +32,7 @@ CREATE TABLE IF NOT EXISTS downloads (
     download_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     task_id INTEGER,
     file_path TEXT,
+    file_size INTEGER,
     page_count INTEGER,
     bookmarks INTEGER,
     tags TEXT,
@@ -66,6 +69,28 @@ class DatabaseManager:
         """首次启动时创建 PRD 定义的三张表。"""
         with self._lock, self.connection:
             self.connection.executescript(SCHEMA)
+            columns = {
+                row[1]
+                for row in self.connection.execute("PRAGMA table_info(downloads)")
+            }
+            if "file_size" not in columns:
+                self.connection.execute(
+                    "ALTER TABLE downloads ADD COLUMN file_size INTEGER"
+                )
+            legacy_rows = self.connection.execute(
+                "SELECT artwork_id, file_path FROM downloads WHERE file_size IS NULL"
+            ).fetchall()
+            for row in legacy_rows:
+                if not row["file_path"]:
+                    continue
+                try:
+                    file_size = Path(row["file_path"]).stat().st_size
+                except OSError:
+                    continue
+                self.connection.execute(
+                    "UPDATE downloads SET file_size = ? WHERE artwork_id = ?",
+                    (file_size, row["artwork_id"]),
+                )
 
     def is_downloaded(self, artwork_id: int) -> bool:
         """判断作品是否已有下载记录。"""
@@ -85,6 +110,7 @@ class DatabaseManager:
         title: Optional[str] = None,
         task_id: Optional[int] = None,
         file_path: Optional[str] = None,
+        file_size: Optional[int] = None,
         page_count: Optional[int] = None,
         bookmarks: Optional[int] = None,
         tags: Optional[Iterable[str]] = None,
@@ -99,8 +125,8 @@ class DatabaseManager:
                 """
                 INSERT INTO downloads (
                     artwork_id, artist_id, artist_name, title, task_id,
-                    file_path, page_count, bookmarks, tags
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    file_path, file_size, page_count, bookmarks, tags
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(artwork_id) DO UPDATE SET
                     artist_id = excluded.artist_id,
                     artist_name = excluded.artist_name,
@@ -108,6 +134,7 @@ class DatabaseManager:
                     download_time = CURRENT_TIMESTAMP,
                     task_id = excluded.task_id,
                     file_path = excluded.file_path,
+                    file_size = excluded.file_size,
                     page_count = excluded.page_count,
                     bookmarks = excluded.bookmarks,
                     tags = excluded.tags
@@ -119,6 +146,7 @@ class DatabaseManager:
                     title,
                     task_id,
                     file_path,
+                    file_size,
                     page_count,
                     bookmarks,
                     encoded_tags,
@@ -213,6 +241,105 @@ class DatabaseManager:
                 """,
                 (artist_id, artist_name, checked_at, last_artwork_id),
             )
+
+    def get_download_stats(
+        self,
+        time_range: str = "all",
+        *,
+        as_of: Optional[datetime] = None,
+    ) -> dict[str, Any]:
+        """返回指定日历时间窗口内的下载统计。"""
+        if time_range not in {"7", "30", "all"}:
+            raise ValueError("time_range 必须是 7、30 或 all")
+
+        reference = as_of or datetime.now(timezone.utc)
+        where = ""
+        parameters: tuple[Any, ...] = ()
+        if time_range != "all":
+            days = int(time_range)
+            start = (reference.date() - timedelta(days=days - 1)).isoformat()
+            end = reference.date().isoformat()
+            where = "WHERE date(d.download_time) BETWEEN date(?) AND date(?)"
+            parameters = (start, end)
+
+        with self._lock:
+            rows = self.connection.execute(
+                f"""
+                SELECT d.*, COALESCE(t.task_type, 'artist') AS effective_task_type
+                FROM downloads AS d
+                LEFT JOIN tasks AS t ON t.task_id = d.task_id
+                {where}
+                ORDER BY d.download_time, d.artwork_id
+                """,
+                parameters,
+            ).fetchall()
+
+        artist_counts: Counter[int] = Counter()
+        artist_names: dict[int, str] = {}
+        tag_counts: Counter[str] = Counter()
+        trend_counts: Counter[str] = Counter()
+        task_counts: Counter[str] = Counter()
+        total_size = 0
+
+        for row in rows:
+            item = dict(row)
+            artist_id = item.get("artist_id")
+            if artist_id is not None:
+                artist_id = int(artist_id)
+                artist_counts[artist_id] += 1
+                artist_names[artist_id] = item.get("artist_name") or ""
+            raw_tags = item.get("tags")
+            if raw_tags:
+                try:
+                    tags = json.loads(raw_tags)
+                except (TypeError, json.JSONDecodeError):
+                    tags = [raw_tags]
+                if not isinstance(tags, list):
+                    tags = []
+                tag_counts.update(str(tag) for tag in tags if str(tag))
+            trend_counts[str(item["download_time"])[:10]] += 1
+            task_counts[str(item["effective_task_type"])] += 1
+            total_size += int(item.get("file_size") or 0)
+
+        top_artists = [
+            {
+                "artist_id": artist_id,
+                "artist_name": artist_names[artist_id],
+                "count": count,
+            }
+            for artist_id, count in sorted(
+                artist_counts.items(),
+                key=lambda pair: (-pair[1], pair[0]),
+            )[:10]
+        ]
+        top_tags = [
+            {"tag": tag, "count": count}
+            for tag, count in sorted(
+                tag_counts.items(), key=lambda pair: (-pair[1], pair[0])
+            )[:10]
+        ]
+        trend = [
+            {"date": date, "count": trend_counts[date]}
+            for date in sorted(trend_counts)
+        ]
+        task_types = [
+            {"task_type": task_type, "count": count}
+            for task_type, count in sorted(
+                task_counts.items(), key=lambda pair: (-pair[1], pair[0])
+            )
+        ]
+        return {
+            "range": time_range,
+            "totals": {
+                "downloads": len(rows),
+                "artists": len(artist_counts),
+                "file_size": total_size,
+            },
+            "top_artists": top_artists,
+            "top_tags": top_tags,
+            "trend": trend,
+            "task_types": task_types,
+        }
 
     def get_download_history(self, limit: Optional[int] = None) -> list[dict[str, Any]]:
         """按最近写入顺序返回下载历史。"""

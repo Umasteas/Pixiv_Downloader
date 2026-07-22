@@ -104,6 +104,38 @@
                     </div>
                 </div>
             </div>
+            <div class="col-12 mt-4">
+                <div id="stats-panel" class="card">
+                    <div class="card-body">
+                        <div class="d-flex flex-wrap justify-content-between gap-3 align-items-center">
+                            <div>
+                                <h2 class="h4 mb-1">下载历史统计</h2>
+                                <p class="text-muted mb-0">查看下载规模、热门画师与标签、趋势和任务来源。</p>
+                            </div>
+                            <div>
+                                <label for="stats-range" class="form-label">时间范围</label>
+                                <select id="stats-range" class="form-select">
+                                    <option value="7">最近 7 天</option>
+                                    <option value="30">最近 30 天</option>
+                                    <option value="all" selected>全部</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="row g-3 mt-1 text-center">
+                            <div class="col-md-4"><div class="border rounded p-3"><div class="text-muted">总下载数</div><strong id="stats-total-downloads" class="fs-4">0</strong></div></div>
+                            <div class="col-md-4"><div class="border rounded p-3"><div class="text-muted">画师数</div><strong id="stats-total-artists" class="fs-4">0</strong></div></div>
+                            <div class="col-md-4"><div class="border rounded p-3"><div class="text-muted">文件大小</div><strong id="stats-total-size" class="fs-4">0 B</strong></div></div>
+                        </div>
+                        <div id="stats-feedback" class="alert mt-3 d-none" role="alert"></div>
+                        <div class="row g-4 mt-1">
+                            <div class="col-lg-6"><h3 class="h6">画师下载量 TOP 10</h3><div class="stats-chart-container"><canvas id="stats-artists-chart" aria-label="画师下载量图表" role="img"></canvas></div></div>
+                            <div class="col-lg-6"><h3 class="h6">热门标签 TOP 10</h3><div class="stats-chart-container"><canvas id="stats-tags-chart" aria-label="热门标签图表" role="img"></canvas></div></div>
+                            <div class="col-lg-6"><h3 class="h6">下载趋势</h3><div class="stats-chart-container"><canvas id="stats-trend-chart" aria-label="下载趋势图表" role="img"></canvas></div></div>
+                            <div class="col-lg-6"><h3 class="h6">任务类型分布</h3><div class="stats-chart-container"><canvas id="stats-types-chart" aria-label="任务类型分布图表" role="img"></canvas></div></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
         </div>
         {% endif %}
 
@@ -155,6 +187,7 @@
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <script src="{{ url_for('static', filename='vendor/chart.umd.min.js') }}"></script>
     <script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>
 </html>
