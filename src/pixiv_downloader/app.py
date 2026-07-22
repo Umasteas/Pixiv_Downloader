@@ -9,6 +9,7 @@ from flask import Flask, render_template, jsonify, request
 from flask_socketio import SocketIO
 from .auth import AuthError, AuthManager
 from .config_manager import ConfigManager
+from .download_policy import DownloadPolicy
 from .database import DatabaseManager
 from .downloader import ArtistDownloader
 from .follow_latest import FollowLatestError, FollowLatestScanner
@@ -55,9 +56,9 @@ def _execute_download_task(task, control):
     auth_manager.get_access_token()
     if auth_manager.api is None:
         raise AuthError("Pixiv 登录状态不可用")
-    configured_output = Path(
-        config_manager.get_setting("download", "output_dir", "./downloads")
-    )
+    download_config = config_manager.load_config().get("download", {})
+    policy = DownloadPolicy.from_mapping(download_config)
+    configured_output = Path(download_config.get("output_dir", "./downloads"))
     output_dir = (
         configured_output
         if configured_output.is_absolute()
@@ -72,6 +73,7 @@ def _execute_download_task(task, control):
         database_manager,
         proxy_manager,
         output_dir=output_dir.resolve(),
+        policy=policy,
     )
     options = {
         "task_id": task["task_id"],

@@ -9,6 +9,89 @@ from src.pixiv_downloader import app as app_module
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_start_task_route_returns_before_background_worker_finishes(monkeypatch):
+    import threading
+
+    entered = threading.Event()
+    release = threading.Event()
+    threads = []
+
+    def blocking_start(task_id):
+        entered.set()
+        release.wait(timeout=2)
+
+    def start_background_task(target, *args):
+        thread = threading.Thread(target=target, args=args, daemon=True)
+        thread.start()
+        threads.append(thread)
+        return thread
+
+    monkeypatch.setattr(app_module.task_manager, "start_task", blocking_start)
+    monkeypatch.setattr(app_module.socketio, "start_background_task", start_background_task)
+
+    response = app_module.app.test_client().post("/api/tasks/91/start")
+
+    assert response.status_code == 202
+    assert response.get_json() == {"success": True, "status": "accepted"}
+    assert entered.wait(timeout=1)
+    assert threads[0].is_alive()
+    release.set()
+    threads[0].join(timeout=1)
+    assert not threads[0].is_alive()
+
+
+def test_execute_download_task_passes_runtime_download_policy(monkeypatch, tmp_path):
+    captured = {}
+
+    class Downloader:
+        def __init__(self, api, database, proxy, *, output_dir, policy):
+            captured["policy"] = policy
+
+        async def download_artist(self, artist_id, **options):
+            captured["artist_id"] = artist_id
+
+    class Control:
+        pass
+
+    monkeypatch.setattr(app_module, "ArtistDownloader", Downloader)
+    monkeypatch.setattr(app_module.auth_manager, "get_access_token", lambda: "token")
+    monkeypatch.setattr(app_module.auth_manager, "api", object())
+    monkeypatch.setattr(
+        app_module.config_manager,
+        "load_config",
+        lambda: {
+            "download": {
+                "output_dir": str(tmp_path),
+                "max_concurrent": 2,
+                "retry_times": 4,
+                "retry_delays": [0.25, 1],
+            }
+        },
+    )
+    monkeypatch.setattr(
+        app_module.config_manager,
+        "get_setting",
+        lambda section, key, default=None: str(tmp_path) if key == "output_dir" else default,
+    )
+
+    app_module._execute_download_task(
+        {
+            "task_id": 91,
+            "task_type": "artist",
+            "query": {"artist_id": 123},
+            "downloaded_count": 0,
+            "skipped_count": 0,
+            "failed_count": 0,
+        },
+        Control(),
+    )
+
+    assert captured["artist_id"] == 123
+    assert captured["policy"].max_concurrent == 2
+    assert captured["policy"].retry_times == 4
+    assert captured["policy"].retry_delays == (0.25, 1.0, 1.0, 1.0)
+
+
 def test_project_skeleton_and_dependencies_exist():
     """项目骨架、pytest 与 Flask 依赖均已落盘。"""
     for relative_path in (

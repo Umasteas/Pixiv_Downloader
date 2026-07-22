@@ -1,11 +1,16 @@
 """画师来源的 Pixiv 单图作品下载服务。"""
+import asyncio
 import json
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 import aiohttp
+
+from .download_policy import DownloadPolicy
+from .rate_limiter import AdaptiveLimiter
 
 from .file_organizer import (
     get_artwork_directory,
@@ -21,8 +26,36 @@ def _field(value: Any, name: str, default=None):
     return getattr(value, name, default)
 
 
+async def _control_allows_progress(control) -> bool:
+    if control is None:
+        return True
+    return await asyncio.to_thread(control.checkpoint)
+
+
+@asynccontextmanager
+async def _limiter_slot(limiter):
+    if limiter is not None:
+        await limiter.acquire()
+    try:
+        yield
+    finally:
+        if limiter is not None:
+            await limiter.release()
+
+
 class DownloadError(RuntimeError):
     """作品或文件下载失败。"""
+
+
+class DownloadCancelled(DownloadError):
+    """持久化任务在安全点被取消。"""
+
+
+class _RetryableHttpStatus(RuntimeError):
+    def __init__(self, status: int, retry_after: float | None = None) -> None:
+        super().__init__(f"HTTP {status}")
+        self.status = status
+        self.retry_after = retry_after
 
 
 def parse_page_count(artwork: Any) -> int:
@@ -44,12 +77,16 @@ class ArtistDownloader:
         *,
         output_dir: Path | str = "downloads",
         session_factory: Callable[..., Any] = aiohttp.ClientSession,
+        policy: DownloadPolicy | None = None,
+        sleep: Callable[[float], Any] = asyncio.sleep,
     ) -> None:
         self.api = api
         self.database = database
         self.proxy_manager = proxy_manager
         self.output_dir = Path(output_dir)
         self.session_factory = session_factory
+        self.policy = policy or DownloadPolicy()
+        self.sleep = sleep
 
     def fetch_artist_artworks(self, artist_id: int) -> list[Any]:
         """读取画师的全部作品分页。"""
@@ -80,6 +117,8 @@ class ArtistDownloader:
         *,
         request_options: dict[str, Any] | None = None,
         progress: Callable[[str, int, int | None, bool], None] | None = None,
+        limiter=None,
+        control=None,
     ) -> None:
         """通过统一代理配置流式下载文件，并原子替换目标。"""
         save_path = Path(save_path)
@@ -94,9 +133,19 @@ class ArtistDownloader:
         headers.setdefault("Referer", "https://app-api.pixiv.net/")
         request_options["headers"] = headers
 
-        async def transfer(active_session) -> None:
-            try:
+        async def request_once(active_session) -> tuple[int, int | None]:
+            async with _limiter_slot(limiter):
+                if not await _control_allows_progress(control):
+                    raise DownloadCancelled("下载任务已取消")
                 async with active_session.get(url, **request_options) as response:
+                    status = int(getattr(response, "status", 0) or 0)
+                    if status == 429:
+                        retry_after = self._retry_after_seconds(
+                            getattr(response, "headers", {})
+                        )
+                        raise _RetryableHttpStatus(status, retry_after)
+                    if 500 <= status <= 599:
+                        raise _RetryableHttpStatus(status)
                     response.raise_for_status()
                     total_bytes = getattr(response, "content_length", None)
                     downloaded_bytes = 0
@@ -113,12 +162,30 @@ class ArtistDownloader:
                                     total_bytes,
                                     False,
                                 )
-                temporary.replace(save_path)
-                if progress is not None:
-                    progress(save_path.name, downloaded_bytes, total_bytes, True)
-            except Exception:
-                temporary.unlink(missing_ok=True)
-                raise
+            return downloaded_bytes, total_bytes
+
+        async def transfer(active_session) -> None:
+            for attempt in range(self.policy.retry_times + 1):
+                try:
+                    downloaded_bytes, total_bytes = await request_once(active_session)
+                    temporary.replace(save_path)
+                    if progress is not None:
+                        progress(save_path.name, downloaded_bytes, total_bytes, True)
+                    return
+                except (aiohttp.ClientError, asyncio.TimeoutError, _RetryableHttpStatus) as exc:
+                    temporary.unlink(missing_ok=True)
+                    if attempt >= self.policy.retry_times:
+                        raise DownloadError(f"下载重试耗尽：{url}") from exc
+                    delay = self.policy.retry_delays[attempt]
+                    if isinstance(exc, _RetryableHttpStatus) and exc.status == 429:
+                        if limiter is not None:
+                            await limiter.reduce_limit()
+                        if exc.retry_after is not None:
+                            delay = max(delay, exc.retry_after)
+                    await self.sleep(delay)
+                except Exception:
+                    temporary.unlink(missing_ok=True)
+                    raise
 
         if session is not None:
             await transfer(session)
@@ -134,6 +201,8 @@ class ArtistDownloader:
         request_options: dict[str, Any] | None = None,
         task_id: int | None = None,
         progress: Callable[[str, int, int | None, bool], None] | None = None,
+        limiter=None,
+        control=None,
     ) -> str:
         """下载一个未下载作品，并记录元数据和数据库历史。"""
         artwork_id = int(_field(artwork, "id"))
@@ -148,16 +217,30 @@ class ArtistDownloader:
                 get_page_save_path(save_path, index, url)
                 for index, url in enumerate(urls)
             ]
-            for url, page_path in zip(urls, page_paths):
-                if page_path.exists():
-                    continue
-                await self.download_file(
+            pending_pages = [
+                self.download_file(
                     url,
                     page_path,
                     session=session,
                     request_options=request_options,
                     progress=progress,
+                    limiter=limiter,
+                    control=control,
                 )
+                for url, page_path in zip(urls, page_paths)
+                if not page_path.exists()
+            ]
+            if pending_pages:
+                page_results = await asyncio.gather(
+                    *pending_pages,
+                    return_exceptions=True,
+                )
+                failure = next(
+                    (result for result in page_results if isinstance(result, BaseException)),
+                    None,
+                )
+                if failure is not None:
+                    raise failure
             metadata_path = save_path / "metadata.json"
             file_size = sum(path.stat().st_size for path in page_paths)
         else:
@@ -169,6 +252,8 @@ class ArtistDownloader:
                 session=session,
                 request_options=request_options,
                 progress=progress,
+                limiter=limiter,
+                control=control,
             )
             metadata_path = metadata_path_for(save_path)
             file_size = save_path.stat().st_size
@@ -249,10 +334,13 @@ class ArtistDownloader:
         if control is not None:
             control.set_total(len(items))
         session_options, request_options = self.proxy_manager.aiohttp_options()
+        limiter = AdaptiveLimiter(self.policy.max_concurrent)
         async with self.session_factory(**session_options) as session:
-            for item in items[start_index:]:
-                if control is not None and not control.checkpoint():
-                    break
+            scheduled = list(items[start_index:])
+
+            async def process(item: Any) -> str | None:
+                if not await _control_allows_progress(control):
+                    return None
                 try:
                     status = await self.download_artwork(
                         resolve(item),
@@ -264,13 +352,37 @@ class ArtistDownloader:
                             if control is not None
                             else None
                         ),
+                        limiter=limiter,
+                        control=control,
                     )
+                except DownloadCancelled:
+                    return None
                 except Exception:
                     status = "failed"
+                return status
+
+            statuses = await asyncio.gather(*(process(item) for item in scheduled))
+            checkpoint_prefix_open = True
+            for status in statuses:
+                if status is None:
+                    checkpoint_prefix_open = False
+                    continue
                 result[status] += 1
-                if control is not None:
+                if control is not None and checkpoint_prefix_open:
+                    if not await _control_allows_progress(control):
+                        checkpoint_prefix_open = False
+                        continue
                     control.record_result(status)
         return result
+
+    @staticmethod
+    def _retry_after_seconds(headers: Any) -> float | None:
+        try:
+            value = headers.get("Retry-After")
+            seconds = float(value)
+        except (AttributeError, TypeError, ValueError):
+            return None
+        return seconds if seconds >= 0 else None
 
     @staticmethod
     def _original_image_url(artwork: Any) -> str:

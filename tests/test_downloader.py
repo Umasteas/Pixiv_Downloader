@@ -357,6 +357,7 @@ async def test_multi_page_failure_defers_metadata_and_retry_skips_completed_page
     artwork_dir = tmp_path / "artists" / "画师_名称_456" / "223_续传作品"
     assert (artwork_dir / "p0.jpg").exists()
     assert not (artwork_dir / "p1.jpg").exists()
+    assert (artwork_dir / "p2.jpg").exists()
     assert not (artwork_dir / "metadata.json").exists()
     assert database.mark_calls == []
 
@@ -368,7 +369,6 @@ async def test_multi_page_failure_defers_metadata_and_retry_skips_completed_page
     ) == "downloaded"
     assert [call[0] for call in retry_session.get_calls] == [
         "https://i.pximg.net/retry_p1.jpg",
-        "https://i.pximg.net/retry_p2.jpg",
     ]
     assert (artwork_dir / "metadata.json").exists()
     assert database.mark_calls[0][1]["page_count"] == 3
@@ -520,6 +520,7 @@ def test_artist_download_form_and_api(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_artist_download_resumes_from_checkpoint_and_records_task_progress(tmp_path):
+    from src.pixiv_downloader.download_policy import DownloadPolicy
     from src.pixiv_downloader.downloader import ArtistDownloader
 
     class Api:
@@ -555,7 +556,7 @@ async def test_artist_download_resumes_from_checkpoint_and_records_task_progress
 
         def checkpoint(self):
             self.checkpoints += 1
-            return self.checkpoints == 1
+            return True
 
         def record_result(self, result):
             self.results.append(result)
@@ -571,6 +572,7 @@ async def test_artist_download_resumes_from_checkpoint_and_records_task_progress
         Proxy(),
         output_dir=tmp_path,
         session_factory=FakeSession,
+        policy=DownloadPolicy(1, 0, ()),
     )
 
     result = await downloader.download_artist(
@@ -580,13 +582,17 @@ async def test_artist_download_resumes_from_checkpoint_and_records_task_progress
         control=control,
     )
 
-    assert result == {"total": 3, "downloaded": 1, "skipped": 0, "failed": 0}
+    assert result == {"total": 3, "downloaded": 2, "skipped": 0, "failed": 0}
     assert control.totals == [3]
-    assert control.checkpoints == 2
-    assert control.results == ["downloaded"]
-    assert [call[0] for call in database.mark_calls] == [2]
-    assert database.mark_calls[0][1]["task_id"] == 77
+    assert control.checkpoints >= 4
+    assert control.results == ["downloaded", "downloaded"]
+    assert [call[0] for call in database.mark_calls] == [2, 3]
+    assert all(call[1]["task_id"] == 77 for call in database.mark_calls)
     assert [update[1:] for update in control.file_updates] == [
+        (0, 10, False),
+        (4, 10, False),
+        (10, 10, False),
+        (10, 10, True),
         (0, 10, False),
         (4, 10, False),
         (10, 10, False),
