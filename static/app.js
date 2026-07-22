@@ -192,3 +192,127 @@ if (artistDownloadForm) {
         }
     });
 }
+
+const followCheckButton = document.getElementById('follow-check-button');
+const followArtworkGroups = document.getElementById('follow-artwork-groups');
+
+if (followCheckButton && followArtworkGroups) {
+    const lastCheck = document.getElementById('follow-last-check');
+    const newCount = document.getElementById('follow-new-count');
+    const bookmarkFilter = document.getElementById('follow-bookmark-filter');
+    const selectAll = document.getElementById('follow-select-all');
+    const clearAll = document.getElementById('follow-clear-all');
+    const downloadSelected = document.getElementById('follow-download-selected');
+    const feedback = document.getElementById('follow-feedback');
+
+    const showFollowFeedback = (kind, message) => {
+        feedback.className = `alert alert-${kind} mt-3`;
+        feedback.textContent = message;
+    };
+    const applyBookmarkFilter = () => {
+        const minimum = Math.max(0, Number(bookmarkFilter.value) || 0);
+        followArtworkGroups.querySelectorAll('[data-follow-artwork]').forEach((row) => {
+            const visible = Number(row.dataset.bookmarks) >= minimum;
+            row.classList.toggle('d-none', !visible);
+            if (!visible) row.querySelector('input[type="checkbox"]').checked = false;
+        });
+    };
+    const renderFollowResult = (result) => {
+        followArtworkGroups.replaceChildren();
+        lastCheck.textContent = result.checked_at || '未知';
+        newCount.textContent = String(result.new_count || 0);
+        result.artists.forEach((artist) => {
+            const section = document.createElement('section');
+            section.className = 'border rounded p-3 mb-3';
+            const title = document.createElement('h3');
+            title.className = 'h5';
+            title.textContent = `${artist.artist_name}（${artist.new_count} 个新作品）`;
+            section.appendChild(title);
+            const previous = document.createElement('p');
+            previous.className = 'small text-muted';
+            previous.textContent = `此前检查：${artist.last_check_time || '首次检查'}`;
+            section.appendChild(previous);
+            artist.artworks.forEach((artwork) => {
+                const row = document.createElement('label');
+                row.className = 'd-flex gap-3 align-items-center border-top py-2';
+                row.dataset.followArtwork = String(artwork.artwork_id);
+                row.dataset.bookmarks = String(artwork.bookmarks || 0);
+                const checkbox = document.createElement('input');
+                checkbox.className = 'form-check-input';
+                checkbox.type = 'checkbox';
+                checkbox.checked = true;
+                checkbox.value = String(artwork.artwork_id);
+                checkbox.setAttribute('aria-label', `选择作品 ${artwork.artwork_id}`);
+                const image = document.createElement('img');
+                image.src = artwork.thumbnail_url;
+                image.alt = artwork.title;
+                image.width = 72;
+                image.height = 72;
+                image.loading = 'lazy';
+                image.referrerPolicy = 'no-referrer';
+                image.className = 'rounded object-fit-cover';
+                const details = document.createElement('span');
+                const artworkTitle = document.createElement('strong');
+                artworkTitle.textContent = artwork.title;
+                const bookmarks = document.createElement('small');
+                bookmarks.className = 'd-block text-muted';
+                bookmarks.textContent = `收藏 ${artwork.bookmarks || 0}`;
+                details.append(artworkTitle, bookmarks);
+                row.append(checkbox, image, details);
+                section.appendChild(row);
+            });
+            followArtworkGroups.appendChild(section);
+        });
+        applyBookmarkFilter();
+    };
+
+    followCheckButton.addEventListener('click', async () => {
+        followCheckButton.disabled = true;
+        showFollowFeedback('info', '正在检查关注画师的新作品…');
+        try {
+            const response = await fetch('/api/follow/latest', { method: 'POST' });
+            const payload = await response.json();
+            if (!response.ok) throw new Error(payload.error || '关注新作检查失败。');
+            renderFollowResult(payload.result);
+            showFollowFeedback('success', `检查完成，发现 ${payload.result.new_count} 个新作品。`);
+        } catch (error) {
+            showFollowFeedback('danger', error.message);
+        } finally {
+            followCheckButton.disabled = false;
+        }
+    });
+    bookmarkFilter.addEventListener('input', applyBookmarkFilter);
+    selectAll.addEventListener('click', () => {
+        followArtworkGroups.querySelectorAll('[data-follow-artwork]:not(.d-none) input[type="checkbox"]').forEach((input) => {
+            input.checked = true;
+        });
+    });
+    clearAll.addEventListener('click', () => {
+        followArtworkGroups.querySelectorAll('input[type="checkbox"]').forEach((input) => {
+            input.checked = false;
+        });
+    });
+    downloadSelected.addEventListener('click', async () => {
+        const artworkIds = Array.from(followArtworkGroups.querySelectorAll('input[type="checkbox"]:checked'))
+            .map((input) => Number(input.value));
+        if (!artworkIds.length) {
+            showFollowFeedback('warning', '请至少选择一个作品。');
+            return;
+        }
+        downloadSelected.disabled = true;
+        try {
+            const response = await fetch('/api/follow/download', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ artwork_ids: artworkIds }),
+            });
+            const payload = await response.json();
+            if (!response.ok) throw new Error(payload.error || '创建下载任务失败。');
+            showFollowFeedback('success', `已创建任务 #${payload.task_id}，包含 ${payload.selected_count} 个作品。`);
+        } catch (error) {
+            showFollowFeedback('danger', error.message);
+        } finally {
+            downloadSelected.disabled = false;
+        }
+    });
+}

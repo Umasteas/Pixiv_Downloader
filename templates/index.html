@@ -76,6 +76,34 @@
                     </div>
                 </div>
             </div>
+            <div class="col-12 mt-4">
+                <div id="follow-latest-panel" class="card">
+                    <div class="card-body">
+                        <div class="d-flex flex-wrap justify-content-between gap-3 align-items-center">
+                            <div>
+                                <h2 class="h4 mb-1">关注画师新作</h2>
+                                <p class="text-muted mb-0">手动检查公开及私密关注列表，并选择要加入下载队列的作品。</p>
+                            </div>
+                            <button id="follow-check-button" class="btn btn-primary" type="button">检查关注画师新作</button>
+                        </div>
+                        <div class="row g-3 mt-1">
+                            <div class="col-md-4"><strong>上次检查：</strong><span id="follow-last-check">尚未检查</span></div>
+                            <div class="col-md-3"><strong>新作品：</strong><span id="follow-new-count">0</span></div>
+                            <div class="col-md-5">
+                                <label for="follow-bookmark-filter" class="form-label">最低收藏数</label>
+                                <input id="follow-bookmark-filter" class="form-control" type="number" min="0" value="0">
+                            </div>
+                        </div>
+                        <div class="d-flex flex-wrap gap-2 mt-3">
+                            <button id="follow-select-all" class="btn btn-outline-secondary btn-sm" type="button">全选可见作品</button>
+                            <button id="follow-clear-all" class="btn btn-outline-secondary btn-sm" type="button">取消全选</button>
+                            <button id="follow-download-selected" class="btn btn-success btn-sm" type="button">下载选中项</button>
+                        </div>
+                        <div id="follow-feedback" class="alert mt-3 d-none" role="alert"></div>
+                        <div id="follow-artwork-groups" class="mt-3" aria-live="polite"></div>
+                    </div>
+                </div>
+            </div>
         </div>
         {% endif %}
 

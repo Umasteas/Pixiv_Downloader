@@ -125,6 +125,95 @@ class DatabaseManager:
                 ),
             )
 
+    def create_task(
+        self,
+        *,
+        task_type: str,
+        query: Any = None,
+        filters: Any = None,
+        total_count: Optional[int] = None,
+    ) -> int:
+        """创建一个可供任务管理器后续执行的 pending 任务。"""
+        encoded_query = (
+            json.dumps(query, ensure_ascii=False)
+            if query is not None and not isinstance(query, str)
+            else query
+        )
+        encoded_filters = (
+            json.dumps(filters, ensure_ascii=False)
+            if filters is not None and not isinstance(filters, str)
+            else filters
+        )
+        with self._lock, self.connection:
+            cursor = self.connection.execute(
+                """
+                INSERT INTO tasks (
+                    task_type, query, filters, status, total_count
+                ) VALUES (?, ?, ?, 'pending', ?)
+                """,
+                (task_type, encoded_query, encoded_filters, total_count),
+            )
+        return int(cursor.lastrowid)
+
+    def get_task(self, task_id: int) -> Optional[dict[str, Any]]:
+        """回读单个任务，并恢复结构化 query/filters。"""
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT * FROM tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        for key in ("query", "filters"):
+            value = item.get(key)
+            if value:
+                try:
+                    item[key] = json.loads(value)
+                except (TypeError, json.JSONDecodeError):
+                    pass
+        return item
+
+    def get_followed_artist(self, artist_id: int) -> Optional[dict[str, Any]]:
+        """返回指定关注画师的最近检查状态。"""
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT * FROM followed_artists WHERE artist_id = ?",
+                (artist_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_followed_artists(self) -> list[dict[str, Any]]:
+        """按画师 ID 返回全部已同步的关注画师状态。"""
+        with self._lock:
+            rows = self.connection.execute(
+                "SELECT * FROM followed_artists ORDER BY artist_id"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_followed_artist(
+        self,
+        artist_id: int,
+        *,
+        artist_name: str,
+        last_artwork_id: Optional[int],
+        checked_at: str,
+    ) -> None:
+        """原子写入关注画师名称、检查时间和最新作品 ID。"""
+        with self._lock, self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO followed_artists (
+                    artist_id, artist_name, last_check_time, last_artwork_id
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(artist_id) DO UPDATE SET
+                    artist_name = excluded.artist_name,
+                    last_check_time = excluded.last_check_time,
+                    last_artwork_id = excluded.last_artwork_id
+                """,
+                (artist_id, artist_name, checked_at, last_artwork_id),
+            )
+
     def get_download_history(self, limit: Optional[int] = None) -> list[dict[str, Any]]:
         """按最近写入顺序返回下载历史。"""
         if limit is not None and limit < 0:

@@ -11,6 +11,7 @@ from .auth import AuthError, AuthManager
 from .config_manager import ConfigManager
 from .database import DatabaseManager
 from .downloader import ArtistDownloader
+from .follow_latest import FollowLatestError, FollowLatestScanner
 from .proxy import ProxyConfigError, ProxyManager
 from .runtime import runtime_paths
 
@@ -191,6 +192,64 @@ def download_artist():
             "error": "画师作品下载失败，请检查网络、代理和磁盘空间。",
         }), 500
     return jsonify({"success": True, "result": result})
+
+
+@app.route('/api/follow/latest', methods=['POST'])
+def fetch_follow_latest():
+    """手动扫描公开及私密关注画师的新作品。"""
+    try:
+        auth_manager.get_access_token()
+        if auth_manager.api is None:
+            raise AuthError("Pixiv 登录状态不可用")
+        result = FollowLatestScanner(
+            api=auth_manager.api,
+            database=database_manager,
+        ).fetch_follow_latest()
+    except AuthError:
+        return jsonify({
+            "success": False,
+            "error": "Pixiv 登录失败，请重新配置 Token。",
+        }), 401
+    except FollowLatestError:
+        return jsonify({
+            "success": False,
+            "error": "关注画师列表不可用，请重新登录后重试。",
+        }), 502
+    except Exception:
+        return jsonify({
+            "success": False,
+            "error": "关注新作检查失败，请检查网络和代理设置。",
+        }), 502
+    return jsonify({"success": True, "result": result})
+
+
+@app.route('/api/follow/download', methods=['POST'])
+def create_follow_download_task():
+    """把前端选中的新作品创建为一个待执行任务。"""
+    data = request.get_json(silent=True)
+    raw_ids = data.get("artwork_ids") if isinstance(data, dict) else None
+    if (
+        not isinstance(raw_ids, list)
+        or not raw_ids
+        or len(raw_ids) > 10000
+        or any(type(value) is not int or value <= 0 for value in raw_ids)
+    ):
+        return jsonify({
+            "success": False,
+            "error": "作品 ID 列表必须包含一至 10000 个正整数。",
+        }), 400
+
+    artwork_ids = list(dict.fromkeys(raw_ids))
+    task_id = database_manager.create_task(
+        task_type="follow_latest",
+        query={"artwork_ids": artwork_ids},
+        total_count=len(artwork_ids),
+    )
+    return jsonify({
+        "success": True,
+        "task_id": task_id,
+        "selected_count": len(artwork_ids),
+    })
 
 
 @app.route('/api/tasks', methods=['GET'])
