@@ -1,5 +1,6 @@
 """Pixiv 下载文件的便携目录组织与安全命名。"""
 import re
+from datetime import date
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -57,6 +58,73 @@ def create_directory_structure(
     artist_dir = Path(output_dir) / "artists" / artist_component
     artist_dir.mkdir(parents=True, exist_ok=True)
     return artist_dir
+
+
+def create_search_directory(
+    output_dir: Path | str,
+    keyword: str,
+    task_date: date,
+) -> Path:
+    """创建固定任务日期的搜索集合目录，关键词只作为单个路径组件。"""
+    suffix = f"_{task_date.isoformat()}"
+    keyword_component = sanitize_filename(
+        keyword,
+        max_length=200 - _windows_units(suffix),
+    )
+    search_dir = Path(output_dir) / "search" / f"{keyword_component}{suffix}"
+    search_dir.mkdir(parents=True, exist_ok=True)
+    return search_dir
+
+
+def get_collection_artwork_directory(
+    collection_dir: Path | str,
+    artwork: Any,
+) -> Path:
+    """在搜索/排行/收藏集合根目录中创建多文件作品目录。"""
+    prefix = f"{int(_field(artwork, 'id'))}_"
+    root = Path(collection_dir)
+    reserved = _windows_units("\\metadata.json")
+    available = (
+        _WINDOWS_PATH_BUDGET
+        - _windows_units(str(root.resolve()))
+        - _windows_units("\\")
+        - reserved
+    )
+    if available < _windows_units(prefix) + 1:
+        raise ValueError("输出目录过长，无法创建作品目录")
+    component = prefix + sanitize_filename(
+        _field(artwork, "title", "未命名作品"),
+        max_length=min(200 - _windows_units(prefix), available - _windows_units(prefix)),
+    )
+    artwork_dir = root / component
+    artwork_dir.mkdir(parents=True, exist_ok=True)
+    return artwork_dir
+
+
+def get_collection_save_path(
+    collection_dir: Path | str,
+    artwork: Any,
+) -> Path:
+    """在集合根目录中生成单图路径，不再嵌套 artists 目录。"""
+    user = _field(artwork, "user", {})
+    root = Path(collection_dir)
+    available = (
+        _WINDOWS_PATH_BUDGET
+        - _windows_units(str(root.resolve()))
+        - _windows_units("\\")
+        - _windows_units(".metadata.json")
+    )
+    if available < 1:
+        raise ValueError("输出目录过长，无法创建单图文件")
+    stem = sanitize_filename(
+        (
+            f"{int(_field(artwork, 'id'))}_"
+            f"{_field(user, 'name', '未命名画师')}_"
+            f"{_field(artwork, 'title', '未命名作品')}"
+        ),
+        max_length=min(200, available),
+    )
+    return root / f"{stem}.jpg"
 
 
 def get_artwork_directory(output_dir: Path | str, artwork: Any) -> Path:

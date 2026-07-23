@@ -4,6 +4,7 @@ import webbrowser
 import secrets
 import copy
 import atexit
+from datetime import date
 from pathlib import Path
 from flask import Flask, render_template, jsonify, request
 from flask_socketio import SocketIO
@@ -12,11 +13,13 @@ from .config_manager import ConfigManager
 from .download_policy import DownloadPolicy
 from .database import DatabaseManager
 from .downloader import ArtistDownloader
+from .file_organizer import create_search_directory
 from .follow_latest import FollowLatestError, FollowLatestScanner
 from .filters import FilterValidationError, normalize_filters
 from .logging_setup import configure_logging
 from .proxy import ProxyConfigError, ProxyManager
 from .runtime import runtime_paths
+from .search import SearchValidationError, normalize_search_query
 from .task_manager import TaskManager, TaskManagerError
 from .ugoira import check_ffmpeg
 
@@ -49,7 +52,7 @@ atexit.register(database_manager.close)
 
 
 def _execute_download_task(task, control):
-    """执行画师或关注选中项任务，并从持久化计数位置续传。"""
+    """执行持久化下载任务，并从已完成的连续前缀恢复。"""
     query = task.get("query")
     if not isinstance(query, dict):
         raise TaskManagerError("任务缺少有效查询")
@@ -59,6 +62,13 @@ def _execute_download_task(task, control):
         if type(value) is not int or value <= 0:
             raise TaskManagerError("画师任务缺少有效 ID")
         filters = normalize_filters(task.get("filters"))
+    elif task_type == "search":
+        try:
+            value = normalize_search_query(query)
+            filters = normalize_filters(task.get("filters"))
+            task_date = date.fromisoformat(str(task.get("created_time", ""))[:10])
+        except (SearchValidationError, FilterValidationError, ValueError):
+            raise TaskManagerError("搜索任务缺少有效查询") from None
     elif task_type in {"follow_latest", "retry_failed"}:
         value = query.get("artwork_ids")
         if (
@@ -86,13 +96,25 @@ def _execute_download_task(task, control):
         int(task.get(key) or 0)
         for key in ("downloaded_count", "skipped_count", "failed_count")
     )
+    downloader_options = {
+        "output_dir": output_dir.resolve(),
+        "policy": policy,
+        "ugoira_options": ugoira_config,
+    }
+    if task_type == "search":
+        downloader_options.update({
+            "collection_dir": create_search_directory(
+                output_dir.resolve(),
+                value["keyword"],
+                task_date,
+            ),
+            "source": "search",
+        })
     downloader = ArtistDownloader(
         auth_manager.api,
         database_manager,
         proxy_manager,
-        output_dir=output_dir.resolve(),
-        policy=policy,
-        ugoira_options=ugoira_config,
+        **downloader_options,
     )
     options = {
         "task_id": task["task_id"],
@@ -102,6 +124,15 @@ def _execute_download_task(task, control):
     if task_type == "artist":
         operation = downloader.download_artist(
             value,
+            filters=filters,
+            **options,
+        )
+    elif task_type == "search":
+        operation = downloader.download_search(
+            value["keyword"],
+            value["search_type"],
+            value["sort"],
+            value["limit"],
             filters=filters,
             **options,
         )
@@ -152,8 +183,11 @@ def auth_login():
     refresh_token = data.get('refresh_token', '')
     try:
         auth_manager.login(refresh_token)
-    except AuthError as exc:
-        return jsonify({"success": False, "error": str(exc)}), 400
+    except AuthError:
+        return jsonify({
+            "success": False,
+            "error": "Token 验证失败，请检查 Refresh Token 或网络设置。",
+        }), 400
     return jsonify({
         "success": True,
         "message": "Token 验证成功，已安全保存。",
@@ -442,14 +476,42 @@ def retry_failed_task(task_id):
 def create_task():
     """创建任务"""
     data = request.get_json(silent=True)
-    query = data.get("query") if isinstance(data, dict) else None
-    artist_id = query.get("artist_id") if isinstance(query, dict) else None
-    if (
-        not isinstance(data, dict)
-        or data.get("task_type") != "artist"
-        or type(artist_id) is not int
-        or artist_id <= 0
-    ):
+    if not isinstance(data, dict):
+        return jsonify({
+            "success": False,
+            "error": "画师任务必须包含正整数 artist_id。",
+        }), 400
+
+    task_type = data.get("task_type")
+    query = data.get("query")
+    if task_type == "artist":
+        artist_id = query.get("artist_id") if isinstance(query, dict) else None
+        if type(artist_id) is not int or artist_id <= 0:
+            return jsonify({
+                "success": False,
+                "error": "画师任务必须包含正整数 artist_id。",
+            }), 400
+        normalized_query = {"artist_id": artist_id}
+    elif task_type == "search":
+        try:
+            normalized_query = normalize_search_query(query)
+            filters = normalize_filters(data.get("filters"))
+        except (SearchValidationError, FilterValidationError):
+            return jsonify({
+                "success": False,
+                "error": "搜索条件或筛选条件无效。",
+            }), 400
+        task_id = task_manager.create_task(
+            task_type="search",
+            query=normalized_query,
+            filters=filters,
+        )
+        return jsonify({
+            "success": True,
+            "task_id": task_id,
+            "status": "pending",
+        }), 201
+    else:
         return jsonify({
             "success": False,
             "error": "画师任务必须包含正整数 artist_id。",
@@ -463,7 +525,7 @@ def create_task():
         }), 400
     task_id = task_manager.create_task(
         task_type="artist",
-        query={"artist_id": artist_id},
+        query=normalized_query,
         filters=filters,
     )
     return jsonify({"success": True, "task_id": task_id, "status": "pending"}), 201

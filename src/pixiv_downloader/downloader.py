@@ -20,6 +20,7 @@ from .errors import (
 )
 from .filters import filter_artworks
 from .rate_limiter import AdaptiveLimiter
+from .search import normalize_search_query
 from .ugoira import (
     check_ffmpeg,
     convert_to_gif,
@@ -28,6 +29,8 @@ from .ugoira import (
 )
 
 from .file_organizer import (
+    get_collection_artwork_directory,
+    get_collection_save_path,
     get_artwork_directory,
     get_page_save_path,
     get_save_path,
@@ -98,6 +101,8 @@ class ArtistDownloader:
         policy: DownloadPolicy | None = None,
         sleep: Callable[[float], Any] = asyncio.sleep,
         ugoira_options: dict[str, Any] | None = None,
+        collection_dir: Path | str | None = None,
+        source: str = "artist",
         gif_converter=convert_to_gif,
         mp4_converter=convert_to_mp4,
         ffmpeg_checker=check_ffmpeg,
@@ -106,6 +111,8 @@ class ArtistDownloader:
         self.database = database
         self.proxy_manager = proxy_manager
         self.output_dir = Path(output_dir)
+        self.collection_dir = Path(collection_dir) if collection_dir is not None else None
+        self.source = source
         self.session_factory = session_factory
         self.policy = policy or DownloadPolicy()
         self.sleep = sleep
@@ -140,6 +147,73 @@ class ArtistDownloader:
             if not options:
                 break
         return artworks
+
+    def fetch_search_results(
+        self,
+        keyword: str,
+        search_type: str,
+        sort: str,
+        limit: int,
+    ) -> list[Any]:
+        """按稳定 query 获取有界候选窗口；收藏数排序在窗口内执行。"""
+        query = normalize_search_query({
+            "keyword": keyword,
+            "search_type": search_type,
+            "sort": sort,
+            "limit": limit,
+        })
+        search_target = {
+            "tag_exact": "exact_match_for_tags",
+            "tag_partial": "partial_match_for_tags",
+        }[query["search_type"]]
+        api_sort = "popular_desc" if query["sort"] == "popular" else "date_desc"
+        artworks: list[Any] = []
+        seen_artwork_ids: set[int] = set()
+        seen_offsets: set[str] = set()
+        offset: str | None = None
+
+        while True:
+            options: dict[str, Any] = {
+                "search_target": search_target,
+                "sort": api_sort,
+            }
+            if offset is not None:
+                options["offset"] = offset
+            response = self.api.search_illust(query["keyword"], **options)
+            count_before_page = len(artworks)
+            for artwork in _field(response, "illusts", []) or []:
+                if len(artworks) >= query["limit"]:
+                    break
+                artwork_id = int(_field(artwork, "id"))
+                if artwork_id in seen_artwork_ids:
+                    continue
+                seen_artwork_ids.add(artwork_id)
+                artworks.append(artwork)
+                if query["sort"] != "bookmarks" and len(artworks) >= query["limit"]:
+                    return artworks[:query["limit"]]
+
+            if len(artworks) >= query["limit"]:
+                break
+            if len(artworks) == count_before_page:
+                break
+
+            next_url = _field(response, "next_url")
+            if not next_url:
+                break
+            values = parse_qs(urlparse(str(next_url)).query).get("offset", [])
+            if len(values) != 1 or not values[0].isdigit() or values[0] in seen_offsets:
+                break
+            offset = values[0]
+            seen_offsets.add(offset)
+
+        if query["sort"] == "bookmarks":
+            artworks.sort(
+                key=lambda artwork: int(
+                    _field(artwork, "total_bookmarks", 0) or 0
+                ),
+                reverse=True,
+            )
+        return artworks[:query["limit"]]
 
     async def download_file(
         self,
@@ -280,7 +354,7 @@ class ArtistDownloader:
             )
         elif page_count > 1:
             urls = self._original_image_urls(artwork)
-            save_path = get_artwork_directory(self.output_dir, artwork)
+            save_path = self._artwork_directory(artwork)
             page_paths = [
                 get_page_save_path(save_path, index, url)
                 for index, url in enumerate(urls)
@@ -314,7 +388,7 @@ class ArtistDownloader:
             metadata_path = save_path / "metadata.json"
             file_size = sum(path.stat().st_size for path in page_paths)
         else:
-            save_path = get_save_path(self.output_dir, artwork)
+            save_path = self._save_path(artwork)
             image_url = self._original_image_url(artwork)
             await self.download_file(
                 image_url,
@@ -405,7 +479,7 @@ class ArtistDownloader:
         if not selected:
             raise DownloadError("Ugoira 至少需要选择一种保存格式。")
         artwork_id = int(_field(artwork, "id"))
-        artwork_dir = get_artwork_directory(self.output_dir, artwork)
+        artwork_dir = self._artwork_directory(artwork)
         archive_path = artwork_dir / "ugoira.zip"
         frames = await self.download_ugoira_zip(
             artwork_id,
@@ -473,6 +547,31 @@ class ArtistDownloader:
         """下载画师的全部单图，单个作品失败时继续后续作品。"""
         artworks = filter_artworks(
             self.fetch_artist_artworks(int(artist_id)),
+            filters,
+        )
+        return await self._download_items(
+            artworks,
+            lambda artwork: artwork,
+            task_id=task_id,
+            start_index=start_index,
+            control=control,
+        )
+
+    async def download_search(
+        self,
+        keyword: str,
+        search_type: str,
+        sort: str,
+        limit: int,
+        *,
+        task_id: int | None = None,
+        start_index: int = 0,
+        control=None,
+        filters: dict[str, Any] | None = None,
+    ) -> dict[str, int]:
+        """下载规范化搜索结果，并复用筛选、并发和恢复语义。"""
+        artworks = filter_artworks(
+            self.fetch_search_results(keyword, search_type, sort, limit),
             filters,
         )
         return await self._download_items(
@@ -662,8 +761,17 @@ class ArtistDownloader:
             temporary.unlink(missing_ok=True)
             raise
 
-    @staticmethod
-    def _metadata(artwork: Any, save_path: Path) -> dict[str, Any]:
+    def _artwork_directory(self, artwork: Any) -> Path:
+        if self.collection_dir is not None:
+            return get_collection_artwork_directory(self.collection_dir, artwork)
+        return get_artwork_directory(self.output_dir, artwork)
+
+    def _save_path(self, artwork: Any) -> Path:
+        if self.collection_dir is not None:
+            return get_collection_save_path(self.collection_dir, artwork)
+        return get_save_path(self.output_dir, artwork)
+
+    def _metadata(self, artwork: Any, save_path: Path) -> dict[str, Any]:
         user = _field(artwork, "user", {})
         raw_tags = _field(artwork, "tags", []) or []
         tags = [str(_field(tag, "name", tag)) for tag in raw_tags]
@@ -679,7 +787,7 @@ class ArtistDownloader:
             "page_count": parse_page_count(artwork),
             "create_date": str(_field(artwork, "create_date", "")),
             "download_info": {
-                "source": "artist",
+                "source": self.source,
                 "downloaded_at": datetime.now(timezone.utc).isoformat(),
                 "file_path": str(save_path),
             },

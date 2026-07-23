@@ -103,6 +103,63 @@
                 </div>
             </div>
             <div class="col-12 mt-4">
+                <div class="card">
+                    <div class="card-body">
+                        <h2 class="h4">按关键词搜索下载</h2>
+                        <p class="text-muted">搜索 Pixiv 标签作品，并按搜索结果日期、热门度或收藏数下载。</p>
+                        <form id="search-download-form" class="row g-3 align-items-end">
+                            <div class="col-md-5">
+                                <label for="search-keyword" class="form-label">关键词</label>
+                                <input id="search-keyword" class="form-control" maxlength="200" required autocomplete="off">
+                            </div>
+                            <div class="col-md-3">
+                                <label for="search-type" class="form-label">搜索类型</label>
+                                <select id="search-type" class="form-select">
+                                    <option value="tag_partial" selected>标签部分匹配</option>
+                                    <option value="tag_exact">标签精确匹配</option>
+                                </select>
+                            </div>
+                            <div class="col-md-2">
+                                <label for="search-sort" class="form-label">排序</label>
+                                <select id="search-sort" class="form-select">
+                                    <option value="popular">热门度</option>
+                                    <option value="date" selected>日期</option>
+                                    <option value="bookmarks">收藏数</option>
+                                </select>
+                            </div>
+                            <div class="col-md-2">
+                                <label for="search-limit" class="form-label">数量</label>
+                                <input id="search-limit" class="form-control" type="number" min="1" max="10000" value="500" required inputmode="numeric">
+                            </div>
+                            <fieldset class="col-md-5">
+                                <legend class="form-label fs-6">作品类型</legend>
+                                <div class="d-flex flex-wrap gap-3">
+                                    <label><input class="form-check-input" type="checkbox" name="search-work-types" value="illust" checked> 插画</label>
+                                    <label><input class="form-check-input" type="checkbox" name="search-work-types" value="manga" checked> 漫画</label>
+                                    <label><input class="form-check-input" type="checkbox" name="search-work-types" value="ugoira" checked> 动图</label>
+                                </div>
+                            </fieldset>
+                            <fieldset class="col-md-5">
+                                <legend class="form-label fs-6">分级</legend>
+                                <div class="d-flex flex-wrap gap-3">
+                                    <label><input class="form-check-input" type="checkbox" name="search-r18-modes" value="general" checked> 全年龄</label>
+                                    <label><input class="form-check-input" type="checkbox" name="search-r18-modes" value="r18" checked> R-18</label>
+                                    <label><input class="form-check-input" type="checkbox" name="search-r18-modes" value="r18g" checked> R-18-G</label>
+                                </div>
+                            </fieldset>
+                            <div class="col-md-2">
+                                <label for="search-min-bookmarks" class="form-label">最低收藏数</label>
+                                <input id="search-min-bookmarks" class="form-control" type="number" min="0" value="0" inputmode="numeric">
+                            </div>
+                            <div class="col-12">
+                                <button id="search-download-submit" class="btn btn-primary" type="submit">创建搜索任务</button>
+                            </div>
+                        </form>
+                        <div id="search-download-feedback" class="alert mt-3 d-none" role="alert"></div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-12 mt-4">
                 <div id="task-panel" class="card">
                     <div class="card-body">
                         <div class="d-flex flex-wrap justify-content-between align-items-center gap-2">

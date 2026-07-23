@@ -413,6 +413,28 @@ def test_auth_status_and_login_routes_report_success(monkeypatch):
     assert stub.login_calls == ["new-refresh-token"]
 
 
+def test_auth_login_does_not_expose_auth_error_details(monkeypatch):
+    from src.pixiv_downloader.auth import AuthError
+
+    class FailingAuthManager:
+        def login(self, refresh_token):
+            raise AuthError("LEAKED_SECRET_TOKEN")
+
+    monkeypatch.setattr(app_module, "auth_manager", FailingAuthManager())
+
+    response = app_module.app.test_client().post(
+        "/api/auth/login",
+        json={"refresh_token": "submitted-secret"},
+    )
+
+    assert response.status_code == 400
+    assert response.get_json() == {
+        "success": False,
+        "error": "Token 验证失败，请检查 Refresh Token 或网络设置。",
+    }
+    assert "LEAKED_SECRET_TOKEN" not in response.get_data(as_text=True)
+
+
 def test_config_api_masks_token_without_mutating_stored_value(tmp_path, monkeypatch):
     from src.pixiv_downloader.config_manager import ConfigManager
 
@@ -740,5 +762,6 @@ def test_auth_login_route_reports_validation_failure(monkeypatch):
     assert response.status_code == 400
     assert response.get_json() == {
         "success": False,
-        "error": "Token 验证失败：invalid",
+        "error": "Token 验证失败，请检查 Refresh Token 或网络设置。",
     }
+    assert "invalid" not in response.get_data(as_text=True)

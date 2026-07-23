@@ -314,6 +314,7 @@ const renderTasks = (tasks) => {
         const filterSummary = formatFilterSummary(task.filters);
         let taskLabel = task.task_type;
         if (artistId) taskLabel = `画师 ${artistId}`;
+        if (task.task_type === 'search') taskLabel = `搜索 ${task.query?.keyword}`;
         if (task.task_type === 'retry_failed') {
             taskLabel = `失败项重试（来源任务 #${task.query?.source_task_id}）`;
         }
@@ -520,6 +521,73 @@ if (artistDownloadForm) {
             }
             feedback.className = 'alert alert-success mt-3';
             feedback.textContent = `已创建等待中的任务 #${payload.task_id}，请在任务列表中开始。`;
+            await loadTasks();
+        } catch (error) {
+            feedback.className = 'alert alert-danger mt-3';
+            feedback.textContent = error.message;
+        } finally {
+            submitButton.disabled = false;
+        }
+    });
+}
+
+const searchDownloadForm = document.getElementById('search-download-form');
+
+if (searchDownloadForm) {
+    const keywordInput = document.getElementById('search-keyword');
+    const searchTypeInput = document.getElementById('search-type');
+    const sortInput = document.getElementById('search-sort');
+    const limitInput = document.getElementById('search-limit');
+    const minBookmarksInput = document.getElementById('search-min-bookmarks');
+    const submitButton = document.getElementById('search-download-submit');
+    const feedback = document.getElementById('search-download-feedback');
+    const checkedValues = (name) => Array.from(
+        searchDownloadForm.querySelectorAll(`input[name="${name}"]:checked`),
+        (input) => input.value,
+    );
+
+    searchDownloadForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const keyword = keywordInput.value.trim();
+        const limit = Number(limitInput.value);
+        const workTypes = checkedValues('search-work-types');
+        const r18Modes = checkedValues('search-r18-modes');
+        if (!keyword || !Number.isInteger(limit) || limit < 1 || limit > 10000) {
+            feedback.className = 'alert alert-danger mt-3';
+            feedback.textContent = '请输入关键词，并将数量设为 1 至 10000 的整数。';
+            return;
+        }
+        if (!workTypes.length || !r18Modes.length) {
+            feedback.className = 'alert alert-danger mt-3';
+            feedback.textContent = '请至少选择一种作品类型和一个分级。';
+            return;
+        }
+        submitButton.disabled = true;
+        feedback.className = 'alert alert-info mt-3';
+        feedback.textContent = '正在创建搜索任务…';
+        try {
+            const response = await fetch('/api/tasks', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    task_type: 'search',
+                    query: {
+                        keyword,
+                        search_type: searchTypeInput.value,
+                        sort: sortInput.value,
+                        limit,
+                    },
+                    filters: {
+                        work_types: workTypes,
+                        r18_modes: r18Modes,
+                        min_bookmarks: Number(minBookmarksInput.value) || 0,
+                    },
+                }),
+            });
+            const payload = await response.json();
+            if (!response.ok) throw new Error(payload.error || '搜索任务创建失败。');
+            feedback.className = 'alert alert-success mt-3';
+            feedback.textContent = `已创建搜索任务 #${payload.task_id}，请在任务列表中开始。`;
             await loadTasks();
         } catch (error) {
             feedback.className = 'alert alert-danger mt-3';
