@@ -9,11 +9,20 @@ from pathlib import Path
 from flask import Flask, render_template, jsonify, request
 from flask_socketio import SocketIO
 from .auth import AuthError, AuthManager
+from .bookmarks import (
+    BookmarksValidationError,
+    normalize_bookmarks_query,
+    normalize_persisted_bookmarks_query,
+)
 from .config_manager import ConfigManager
 from .download_policy import DownloadPolicy
 from .database import DatabaseManager
 from .downloader import ArtistDownloader
-from .file_organizer import create_ranking_directory, create_search_directory
+from .file_organizer import (
+    create_bookmarks_directory,
+    create_ranking_directory,
+    create_search_directory,
+)
 from .follow_latest import FollowLatestError, FollowLatestScanner
 from .filters import FilterValidationError, normalize_filters
 from .logging_setup import configure_logging
@@ -76,6 +85,13 @@ def _execute_download_task(task, control):
             filters = normalize_filters(task.get("filters"))
         except (RankingValidationError, FilterValidationError):
             raise TaskManagerError("排行榜任务缺少有效查询") from None
+    elif task_type == "bookmarks":
+        try:
+            value = normalize_persisted_bookmarks_query(query)
+            filters = normalize_filters(task.get("filters"))
+            task_date = date.fromisoformat(str(task.get("created_time", ""))[:10])
+        except (BookmarksValidationError, FilterValidationError, ValueError):
+            raise TaskManagerError("收藏任务缺少有效查询") from None
     elif task_type in {"follow_latest", "retry_failed"}:
         value = query.get("artwork_ids")
         if (
@@ -130,6 +146,20 @@ def _execute_download_task(task, control):
                 "ranking_date": value["date"],
             },
         })
+    elif task_type == "bookmarks":
+        downloader_options.update({
+            "collection_dir": create_bookmarks_directory(
+                output_dir.resolve(),
+                task_date,
+            ),
+            "source": "bookmarks",
+            "metadata_context": {
+                "visibility": value["visibility"],
+                "tag": value["tag"],
+                "sort": value["sort"],
+            },
+            "user_id": auth_manager.get_user_id(),
+        })
     downloader = ArtistDownloader(
         auth_manager.api,
         database_manager,
@@ -164,6 +194,19 @@ def _execute_download_task(task, control):
             filters=filters,
             **options,
         )
+    elif task_type == "bookmarks":
+        operation = downloader.download_bookmarks(
+            value["visibility"],
+            value["tag"],
+            value["sort"],
+            value["limit"],
+            filters=filters,
+            artwork_ids=value.get("artwork_ids"),
+            snapshot_callback=lambda artwork_ids: database_manager.set_bookmark_snapshot(
+                task["task_id"], artwork_ids
+            ),
+            **options,
+        )
     else:
         operation = downloader.download_artwork_ids(value, **options)
     asyncio.run(operation)
@@ -172,6 +215,39 @@ def _execute_download_task(task, control):
 def _publish_task_event(event, payload):
     """从后台任务线程广播本机单用户任务事件。"""
     socketio.emit(event, payload)
+
+
+def _public_task(task):
+    """投影可公开给前端的任务字段，隐藏内部候选快照与私密标签。"""
+    result = dict(task)
+    query = task.get("query")
+    if not isinstance(query, dict):
+        return result
+    public_query = dict(query)
+    public_query.pop("artwork_ids", None)
+    if (
+        task.get("task_type") == "bookmarks"
+        and public_query.get("visibility") == "private"
+    ):
+        public_query["tag_redacted"] = public_query.get("tag") is not None
+        public_query["tag"] = None
+    result["query"] = public_query
+    return result
+
+
+def _public_task_failures(task, failures):
+    """私密收藏及其重试链不向 REST 响应暴露作品 ID。"""
+    redact_artwork_ids = task.get("task_type") == "retry_failed" or (
+        task.get("task_type") == "bookmarks"
+        and isinstance(task.get("query"), dict)
+        and task["query"].get("visibility") == "private"
+    )
+    if not redact_artwork_ids:
+        return failures
+    return [
+        {key: value for key, value in failure.items() if key != "artwork_id"}
+        for failure in failures
+    ]
 
 
 task_manager = TaskManager(
@@ -197,6 +273,7 @@ def index():
         needs_setup=not auth_manager.has_saved_token(),
         startup_connectivity=startup_connectivity,
         startup_ffmpeg=startup_ffmpeg,
+        security_token=SECURITY_TOKEN,
     )
 
 @app.route('/api/auth/status', methods=['GET'])
@@ -453,7 +530,9 @@ def get_download_stats():
 @app.route('/api/tasks', methods=['GET'])
 def get_tasks():
     """获取任务列表"""
-    return jsonify({"tasks": task_manager.list_tasks()})
+    return jsonify({"tasks": [
+        _public_task(task) for task in task_manager.list_tasks()
+    ]})
 
 
 @app.route('/api/tasks/<int:task_id>', methods=['GET'])
@@ -464,8 +543,11 @@ def get_task_detail(task_id):
         return jsonify({"success": False, "error": "任务不存在。"}), 404
     return jsonify({
         "success": True,
-        "task": task,
-        "failed_artworks": database_manager.list_task_failures(task_id),
+        "task": _public_task(task),
+        "failed_artworks": _public_task_failures(
+            task,
+            database_manager.list_task_failures(task_id),
+        ),
     })
 
 
@@ -499,6 +581,40 @@ def retry_failed_task(task_id):
         "selected_count": len(artwork_ids),
         "status": "pending",
     }), 201
+
+@app.route('/api/bookmarks/tags', methods=['GET'])
+def get_bookmark_tags():
+    """返回当前登录用户指定公开范围的收藏标签。"""
+    visibility = request.args.get("visibility", "public")
+    try:
+        query = normalize_bookmarks_query({"visibility": visibility})
+    except BookmarksValidationError:
+        return jsonify({"success": False, "error": "收藏类型无效。"}), 400
+    if query["visibility"] == "private" and not secrets.compare_digest(
+        request.headers.get("X-App-Token", ""),
+        SECURITY_TOKEN,
+    ):
+        return jsonify({"success": False, "error": "无权读取私密收藏标签。"}), 403
+    try:
+        user_id = auth_manager.get_user_id()
+        downloader = ArtistDownloader(
+            auth_manager.api,
+            database_manager,
+            proxy_manager,
+            output_dir=RUNTIME_PATHS.application_dir,
+            user_id=user_id,
+        )
+        tags = downloader.fetch_bookmark_tags(query["visibility"])
+    except AuthError:
+        return jsonify({"success": False, "error": "请先完成 Pixiv 登录。"}), 401
+    except Exception:
+        return jsonify({"success": False, "error": "收藏标签获取失败。"}), 502
+    return jsonify({
+        "success": True,
+        "visibility": query["visibility"],
+        "tags": tags,
+    })
+
 
 @app.route('/api/tasks', methods=['POST'])
 def create_task():
@@ -558,6 +674,25 @@ def create_task():
             "task_id": task_id,
             "status": "pending",
         }), 201
+    elif task_type == "bookmarks":
+        try:
+            normalized_query = normalize_bookmarks_query(query)
+            filters = normalize_filters(data.get("filters"))
+        except (BookmarksValidationError, FilterValidationError):
+            return jsonify({
+                "success": False,
+                "error": "收藏条件或筛选条件无效。",
+            }), 400
+        task_id = task_manager.create_task(
+            task_type="bookmarks",
+            query=normalized_query,
+            filters=filters,
+        )
+        return jsonify({
+            "success": True,
+            "task_id": task_id,
+            "status": "pending",
+        }), 201
     else:
         return jsonify({
             "success": False,
@@ -603,7 +738,7 @@ def control_task(task_id, action):
         task = target(task_id)
     except TaskManagerError as exc:
         return jsonify({"success": False, "error": str(exc)}), 409
-    return jsonify({"success": True, "task": task})
+    return jsonify({"success": True, "task": _public_task(task)})
 
 @socketio.on('connect')
 def handle_connect():

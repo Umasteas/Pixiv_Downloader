@@ -111,3 +111,27 @@ def test_validate_token_reports_success_and_failure_without_leaking_exceptions(t
 
     assert valid_manager.validate_token("valid-token") is True
     assert invalid_manager.validate_token("invalid-token") is False
+
+
+def test_get_user_id_requires_authenticated_positive_integer(tmp_path):
+    api = FakePixivAPI()
+    api.user_id = "42"
+    manager, _ = make_manager(tmp_path, api)
+    manager.login("valid-token")
+
+    assert manager.get_user_id() == 42
+
+    for invalid in (None, True, 0, -1, "bad"):
+        api.user_id = invalid
+        with pytest.raises(AuthError, match="用户 ID"):
+            manager.get_user_id()
+
+
+def test_get_user_id_rejects_float_instead_of_truncating_it(tmp_path):
+    api = FakePixivAPI()
+    api.user_id = 42.9
+    manager, _ = make_manager(tmp_path, api)
+    manager.login("valid-token")
+
+    with pytest.raises(AuthError, match="用户 ID"):
+        manager.get_user_id()

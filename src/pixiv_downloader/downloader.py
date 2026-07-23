@@ -10,6 +10,16 @@ from urllib.parse import parse_qs, urlparse
 
 import aiohttp
 
+from .bookmarks import (
+    BookmarksValidationError,
+    MAX_CONSECUTIVE_NO_PROGRESS_PAGES,
+    MAX_BOOKMARK_ITEMS,
+    MAX_BOOKMARK_PAGES,
+    MAX_BOOKMARK_TAGS,
+    normalize_bookmark_tag,
+    normalize_bookmarks_query,
+    normalize_persisted_bookmarks_query,
+)
 from .download_policy import DownloadPolicy
 from .errors import (
     ErrorCategory,
@@ -105,6 +115,7 @@ class ArtistDownloader:
         collection_dir: Path | str | None = None,
         source: str = "artist",
         metadata_context: dict[str, Any] | None = None,
+        user_id: int | None = None,
         gif_converter=convert_to_gif,
         mp4_converter=convert_to_mp4,
         ffmpeg_checker=check_ffmpeg,
@@ -116,6 +127,7 @@ class ArtistDownloader:
         self.collection_dir = Path(collection_dir) if collection_dir is not None else None
         self.source = source
         self.metadata_context = dict(metadata_context or {})
+        self.user_id = user_id
         self.session_factory = session_factory
         self.policy = policy or DownloadPolicy()
         self.sleep = sleep
@@ -288,6 +300,167 @@ class ArtistDownloader:
             last_offset = next_offset
 
         return artworks[:query["limit"]]
+
+    def fetch_bookmark_tags(self, visibility: str) -> list[str]:
+        """按公开范围读取去重后的收藏标签。"""
+        query = normalize_bookmarks_query({"visibility": visibility})
+        tags: list[str] = []
+        seen: set[str] = set()
+        offset: int | None = None
+        last_offset = -1
+        no_progress_pages = 0
+
+        for _ in range(MAX_BOOKMARK_PAGES):
+            options: dict[str, Any] = {"restrict": query["visibility"]}
+            if offset is not None:
+                options["offset"] = offset
+            response = self.api.user_bookmark_tags_illust(**options)
+            page_items = _field(response, "bookmark_tags", []) or []
+            if not page_items:
+                break
+            count_before_page = len(tags)
+            for item in page_items:
+                try:
+                    name = normalize_bookmark_tag(_field(item, "name"))
+                except BookmarksValidationError:
+                    continue
+                if name is None or name in seen:
+                    continue
+                seen.add(name)
+                tags.append(name)
+                if len(tags) >= MAX_BOOKMARK_TAGS:
+                    return tags
+            if len(tags) == count_before_page:
+                no_progress_pages += 1
+            else:
+                no_progress_pages = 0
+            if no_progress_pages >= MAX_CONSECUTIVE_NO_PROGRESS_PAGES:
+                break
+            next_url = _field(response, "next_url")
+            if not next_url:
+                break
+            values = parse_qs(urlparse(str(next_url)).query).get("offset", [])
+            if len(values) != 1 or not values[0].isdigit() or len(values[0]) > 7:
+                break
+            next_offset = int(values[0])
+            if next_offset <= last_offset or next_offset > 1_000_000:
+                break
+            offset = next_offset
+            last_offset = next_offset
+        return tags
+
+    def fetch_bookmarks(
+        self,
+        visibility: str,
+        tag: str | None,
+        sort: str,
+        limit: int | None,
+        *,
+        control=None,
+    ) -> list[Any]:
+        """读取有界收藏候选，并应用稳定排序。"""
+        query = normalize_bookmarks_query({
+            "visibility": visibility,
+            "tag": tag,
+            "sort": sort,
+            "limit": limit,
+        })
+        if isinstance(self.user_id, bool):
+            raise BookmarksValidationError("收藏条件无效")
+        try:
+            user_id = int(self.user_id)
+        except (TypeError, ValueError, OverflowError):
+            raise BookmarksValidationError("收藏条件无效") from None
+        if user_id <= 0:
+            raise BookmarksValidationError("收藏条件无效")
+
+        artworks: list[Any] = []
+        seen_ids: set[int] = set()
+        cursor: int | None = None
+        last_cursor: int | None = None
+        no_progress_pages = 0
+        collect_limit = (
+            query["limit"]
+            if query["sort"] == "bookmark_time" and query["limit"] is not None
+            else MAX_BOOKMARK_ITEMS
+        )
+
+        for _ in range(MAX_BOOKMARK_PAGES):
+            if control is not None and not control.checkpoint():
+                break
+            options: dict[str, Any] = {
+                "user_id": user_id,
+                "restrict": query["visibility"],
+                "filter": "for_ios",
+            }
+            if query["tag"] is not None:
+                options["tag"] = query["tag"]
+            if cursor is not None:
+                options["max_bookmark_id"] = cursor
+            response = self.api.user_bookmarks_illust(**options)
+            page_items = _field(response, "illusts", []) or []
+            if not page_items:
+                break
+            count_before_page = len(artworks)
+            for artwork in page_items:
+                raw_id = _field(artwork, "id")
+                if isinstance(raw_id, bool):
+                    continue
+                try:
+                    artwork_id = int(raw_id)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if artwork_id <= 0 or artwork_id in seen_ids:
+                    continue
+                seen_ids.add(artwork_id)
+                artworks.append(artwork)
+                if len(artworks) >= collect_limit:
+                    break
+            if len(artworks) >= collect_limit:
+                break
+            if len(artworks) == count_before_page:
+                no_progress_pages += 1
+            else:
+                no_progress_pages = 0
+            if no_progress_pages >= MAX_CONSECUTIVE_NO_PROGRESS_PAGES:
+                break
+            next_url = _field(response, "next_url")
+            if not next_url:
+                break
+            values = parse_qs(urlparse(str(next_url)).query).get("max_bookmark_id", [])
+            if len(values) != 1 or not values[0].isdigit() or len(values[0]) > 20:
+                break
+            next_cursor = int(values[0])
+            if next_cursor <= 0 or (last_cursor is not None and next_cursor >= last_cursor):
+                break
+            cursor = next_cursor
+            last_cursor = next_cursor
+
+        if query["sort"] == "artwork_date":
+            def date_key(artwork):
+                value = str(_field(artwork, "create_date", ""))
+                try:
+                    parsed = datetime.fromisoformat(value)
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    timestamp = parsed.timestamp()
+                except (ValueError, OverflowError, OSError):
+                    timestamp = float("-inf")
+                return timestamp, int(_field(artwork, "id"))
+
+            artworks.sort(key=date_key, reverse=True)
+        elif query["sort"] == "bookmarks":
+            def bookmarks_key(artwork):
+                value = _field(artwork, "total_bookmarks", 0)
+                try:
+                    count = int(value) if not isinstance(value, bool) else 0
+                except (TypeError, ValueError, OverflowError):
+                    count = 0
+                return count, int(_field(artwork, "id"))
+
+            artworks.sort(key=bookmarks_key, reverse=True)
+        result_limit = query["limit"] or MAX_BOOKMARK_ITEMS
+        return artworks[:result_limit]
 
     async def download_file(
         self,
@@ -686,6 +859,61 @@ class ArtistDownloader:
         return await self._download_items(
             artworks,
             lambda artwork: artwork,
+            task_id=task_id,
+            start_index=start_index,
+            control=control,
+        )
+
+    async def download_bookmarks(
+        self,
+        visibility: str,
+        tag: str | None,
+        sort: str,
+        limit: int | None,
+        *,
+        task_id: int | None = None,
+        start_index: int = 0,
+        control=None,
+        filters: dict[str, Any] | None = None,
+        artwork_ids: list[int] | None = None,
+        snapshot_callback: Callable[[list[int]], Any] | None = None,
+    ) -> dict[str, int]:
+        """首次冻结候选 ID；恢复时只使用不可变快照。"""
+        query = normalize_persisted_bookmarks_query({
+            "visibility": visibility,
+            "tag": tag,
+            "sort": sort,
+            "limit": limit,
+            **({"artwork_ids": artwork_ids} if artwork_ids is not None else {}),
+        })
+        if "artwork_ids" in query:
+            items: list[Any] = query["artwork_ids"]
+
+            def resolve(artwork_id: int):
+                artwork = _field(self.api.illust_detail(artwork_id), "illust")
+                if artwork is None:
+                    raise DownloadError("作品详情不存在")
+                return artwork
+        else:
+            if task_id is not None and snapshot_callback is None:
+                raise DownloadError("收藏任务缺少快照持久化回调")
+            fetch_options = {"control": control} if control is not None else {}
+            artworks = self.fetch_bookmarks(
+                query["visibility"],
+                query["tag"],
+                query["sort"],
+                query["limit"],
+                **fetch_options,
+            )
+            items = filter_artworks(artworks, filters)
+            if snapshot_callback is not None:
+                snapshot_callback([int(_field(artwork, "id")) for artwork in items])
+
+            def resolve(artwork):
+                return artwork
+        return await self._download_items(
+            items,
+            resolve,
             task_id=task_id,
             start_index=start_index,
             control=control,

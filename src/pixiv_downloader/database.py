@@ -364,6 +364,51 @@ class DatabaseManager:
             )
         return self.get_task(task_id) if cursor.rowcount == 1 else None
 
+    def set_bookmark_snapshot(
+        self,
+        task_id: int,
+        artwork_ids: list[int],
+    ) -> dict[str, Any]:
+        """在下载前原子冻结收藏任务的有序作品 ID；快照不可覆盖。"""
+        from .bookmarks import normalize_persisted_bookmarks_query
+
+        with self._lock, self.connection:
+            row = self.connection.execute(
+                "SELECT task_type, query, status FROM tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None or row["task_type"] != "bookmarks":
+                raise ValueError("收藏任务快照目标无效")
+            if row["status"] not in {"running", "paused"}:
+                raise ValueError("收藏任务快照只能写入运行中任务")
+            try:
+                query = json.loads(row["query"])
+            except (TypeError, json.JSONDecodeError):
+                raise ValueError("收藏任务快照 query 无效") from None
+            existing = query.get("artwork_ids")
+            if existing is not None:
+                if existing != artwork_ids:
+                    raise ValueError("收藏任务快照不可覆盖")
+                task = self.get_task(task_id)
+                if task is None:
+                    raise ValueError("收藏任务快照目标无效")
+                return task
+            normalized = normalize_persisted_bookmarks_query({
+                **query,
+                "artwork_ids": artwork_ids,
+            })
+            cursor = self.connection.execute(
+                "UPDATE tasks SET query = ? WHERE task_id = ? "
+                "AND task_type = 'bookmarks' AND status IN ('running', 'paused')",
+                (json.dumps(normalized, ensure_ascii=False), task_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("收藏任务快照写入失败")
+        task = self.get_task(task_id)
+        if task is None:
+            raise ValueError("收藏任务快照目标无效")
+        return task
+
     def recover_interrupted_tasks(self) -> int:
         """把上次进程遗留的 running 任务恢复为 paused。"""
         with self._lock, self.connection:

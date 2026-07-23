@@ -1,5 +1,6 @@
 // Pixiv Downloader Frontend
 console.log('Pixiv Downloader initialized');
+const appToken = document.querySelector('meta[name="app-token"]')?.content || '';
 
 // Socket.IO 连接
 const socket = io();
@@ -254,13 +255,18 @@ const renderTaskDetail = (panel, payload) => {
     panel.replaceChildren();
     const counts = document.createElement('p');
     counts.className = 'mb-2';
-    counts.textContent = `成功 ${payload.task.downloaded_count} · 跳过 ${payload.task.skipped_count} · 失败 ${payload.task.failed_count}`;
+    counts.textContent = payload.task.task_type === 'bookmarks'
+        ? `新增 ${payload.task.downloaded_count} · 已存在 ${payload.task.skipped_count} · 失败 ${payload.task.failed_count}`
+        : `成功 ${payload.task.downloaded_count} · 跳过 ${payload.task.skipped_count} · 失败 ${payload.task.failed_count}`;
     panel.append(counts);
     const list = document.createElement('ul');
     list.className = 'mb-0';
     payload.failed_artworks.forEach((failure) => {
         const item = document.createElement('li');
-        item.textContent = `作品 ${failure.artwork_id} · ${failure.message}`;
+        const artwork = failure.artwork_id
+            ? `作品 ${failure.artwork_id}`
+            : '作品 ID 已隐藏';
+        item.textContent = `${artwork} · ${failure.message}`;
         list.append(item);
     });
     if (payload.failed_artworks.length) {
@@ -287,6 +293,10 @@ const rankingLabels = {
     weekly: '综合周榜', monthly: '综合月榜', rookie: '新人榜',
     daily_manga: '漫画日榜', daily_r18: 'R-18 日榜',
     weekly_r18: 'R-18 周榜', weekly_r18g: 'R-18-G 周榜',
+};
+const bookmarkVisibilityLabels = { public: '公开收藏', private: '私密收藏' };
+const bookmarkSortLabels = {
+    bookmark_time: '收藏时间', artwork_date: '作品发布时间', bookmarks: '作品收藏数',
 };
 const formatFilterSummary = (filters) => {
     if (!filters) return '';
@@ -323,6 +333,14 @@ const renderTasks = (tasks) => {
         if (task.task_type === 'search') taskLabel = `搜索 ${task.query?.keyword}`;
         if (task.task_type === 'ranking') {
             taskLabel = `排行榜 ${rankingLabels[task.query?.ranking_type] || task.query?.ranking_type} · ${task.query?.date}`;
+        }
+        if (task.task_type === 'bookmarks') {
+            const visibility = bookmarkVisibilityLabels[task.query?.visibility] || task.query?.visibility;
+            const tag = task.query?.tag_redacted
+                ? '私密标签'
+                : (task.query?.tag || '全部标签');
+            const sort = bookmarkSortLabels[task.query?.sort] || task.query?.sort;
+            taskLabel = `收藏 ${visibility} · ${tag} · ${sort}`;
         }
         if (task.task_type === 'retry_failed') {
             taskLabel = `失败项重试（来源任务 #${task.query?.source_task_id}）`;
@@ -368,7 +386,10 @@ const renderTasks = (tasks) => {
         progress.append(bar);
         const metrics = document.createElement('div');
         metrics.className = 'small text-muted mt-2';
-        metrics.textContent = `进度 ${processed}/${total} · 下载 ${task.downloaded_count} / 跳过 ${task.skipped_count} / 失败 ${task.failed_count} · 速度 ${Number(task.current_speed || 0).toFixed(2)} MB/s · 剩余 ${formatEta(task.eta_seconds)}`;
+        const resultCounts = task.task_type === 'bookmarks'
+            ? `新增 ${task.downloaded_count} / 已存在 ${task.skipped_count} / 失败 ${task.failed_count}`
+            : `下载 ${task.downloaded_count} / 跳过 ${task.skipped_count} / 失败 ${task.failed_count}`;
+        metrics.textContent = `进度 ${processed}/${total} · ${resultCounts} · 速度 ${Number(task.current_speed || 0).toFixed(2)} MB/s · 剩余 ${formatEta(task.eta_seconds)}`;
         const files = document.createElement('ul');
         files.className = 'list-unstyled small mb-0 mt-2';
         (task.current_files || []).slice(0, 5).forEach((file) => {
@@ -687,6 +708,100 @@ if (rankingDownloadForm) {
         } catch (error) {
             feedback.className = 'alert alert-danger mt-3';
             feedback.textContent = error.message;
+        } finally {
+            submitButton.disabled = false;
+        }
+    });
+}
+
+const bookmarksDownloadForm = document.getElementById('bookmarks-download-form');
+
+if (bookmarksDownloadForm) {
+    const visibilityInput = document.getElementById('bookmarks-visibility');
+    const tagInput = document.getElementById('bookmarks-tag');
+    const sortInput = document.getElementById('bookmarks-sort');
+    const limitModeInput = document.getElementById('bookmarks-limit-mode');
+    const limitField = document.getElementById('bookmarks-limit-field');
+    const limitInput = document.getElementById('bookmarks-limit');
+    const submitButton = document.getElementById('bookmarks-download-submit');
+    const feedback = document.getElementById('bookmarks-download-feedback');
+
+    const setFeedback = (kind, message) => {
+        feedback.className = `alert alert-${kind} mt-3`;
+        feedback.textContent = message;
+    };
+    const resetTagOptions = () => {
+        tagInput.replaceChildren();
+        const allOption = document.createElement('option');
+        allOption.value = '';
+        allOption.textContent = '全部标签';
+        tagInput.append(allOption);
+    };
+    const loadBookmarkTags = async () => {
+        resetTagOptions();
+        tagInput.disabled = true;
+        try {
+            const endpoint = '/api/bookmarks/tags?visibility='
+                + encodeURIComponent(visibilityInput.value);
+            const response = await fetch(endpoint, {
+                headers: {'X-App-Token': appToken},
+            });
+            const payload = await response.json();
+            if (!response.ok) throw new Error(payload.error || '收藏标签获取失败。');
+            payload.tags.forEach((tag) => {
+                const option = document.createElement('option');
+                option.value = tag;
+                option.textContent = tag;
+                tagInput.append(option);
+            });
+            feedback.className = 'alert mt-3 d-none';
+        } catch (error) {
+            setFeedback('warning', error.message);
+        } finally {
+            tagInput.disabled = false;
+        }
+    };
+    const updateLimitField = () => {
+        limitField.classList.toggle('d-none', limitModeInput.value !== 'custom');
+    };
+
+    visibilityInput.addEventListener('change', loadBookmarkTags);
+    limitModeInput.addEventListener('change', updateLimitField);
+    updateLimitField();
+    loadBookmarkTags();
+
+    bookmarksDownloadForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const customLimit = Number(limitInput.value);
+        if (
+            limitModeInput.value === 'custom'
+            && (!Number.isInteger(customLimit) || customLimit < 1 || customLimit > 1000)
+        ) {
+            setFeedback('danger', '请将自定义数量设为 1 至 1000 的整数。');
+            return;
+        }
+        submitButton.disabled = true;
+        setFeedback('info', '正在创建收藏任务…');
+        try {
+            const response = await fetch('/api/tasks', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    task_type: 'bookmarks',
+                    query: {
+                        visibility: visibilityInput.value,
+                        tag: tagInput.value || null,
+                        sort: sortInput.value,
+                        limit: limitModeInput.value === 'all' ? null : customLimit,
+                    },
+                }),
+            });
+            const payload = await response.json();
+            if (!response.ok) throw new Error(payload.error || '收藏任务创建失败。');
+            setFeedback('success', `已创建收藏任务 #${payload.task_id}，请在任务列表中开始。`);
+            await loadTasks();
+        } catch (error) {
+            setFeedback('danger', error.message);
         } finally {
             submitButton.disabled = false;
         }

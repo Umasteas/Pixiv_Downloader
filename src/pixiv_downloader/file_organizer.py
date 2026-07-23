@@ -96,6 +96,18 @@ def create_ranking_directory(
     return ranking_dir
 
 
+def create_bookmarks_directory(
+    output_dir: Path | str,
+    task_date: date,
+) -> Path:
+    """创建固定任务日期的收藏集合目录。"""
+    if type(task_date) is not date:
+        raise ValueError("收藏任务日期无效")
+    bookmarks_dir = Path(output_dir) / "bookmarks" / task_date.isoformat()
+    bookmarks_dir.mkdir(parents=True, exist_ok=True)
+    return bookmarks_dir
+
+
 def get_collection_artwork_directory(
     collection_dir: Path | str,
     artwork: Any,

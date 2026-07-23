@@ -80,6 +80,20 @@ class AuthManager:
 
         return self.login(refresh_token)
 
+    def get_user_id(self) -> int:
+        """返回认证响应中的严格正整数 Pixiv 用户 ID。"""
+        self.get_access_token()
+        value = getattr(self.api, "user_id", None)
+        if type(value) is int:
+            user_id = value
+        elif isinstance(value, str) and value.isdigit() and len(value) <= 20:
+            user_id = int(value)
+        else:
+            raise AuthError("认证响应缺少有效用户 ID")
+        if user_id <= 0:
+            raise AuthError("认证响应缺少有效用户 ID")
+        return user_id
+
     def validate_token(self, refresh_token: str) -> bool:
         """验证并保存 Token，以布尔值报告结果。"""
         try:
