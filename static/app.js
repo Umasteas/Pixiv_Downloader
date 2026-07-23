@@ -158,6 +158,70 @@ if (proxyForm && proxyTest) {
         .catch((error) => showProxyFeedback('danger', `代理配置加载失败：${error.message}`));
 }
 
+const ugoiraForm = document.getElementById('ugoira-form');
+
+if (ugoiraForm) {
+    const original = document.getElementById('ugoira-download-original');
+    const gif = document.getElementById('ugoira-convert-gif');
+    const mp4 = document.getElementById('ugoira-convert-mp4');
+    const save = document.getElementById('ugoira-save');
+    const feedback = document.getElementById('ugoira-feedback');
+    const ffmpegStatus = document.getElementById('ugoira-ffmpeg-status');
+    const ffmpegDownload = document.getElementById('ugoira-ffmpeg-download');
+    const payload = () => ({
+        download_original: original.checked,
+        convert_to_gif: gif.checked,
+        convert_to_mp4: mp4.checked,
+    });
+    const renderSettings = (result) => {
+        original.checked = result.ugoira.download_original;
+        gif.checked = result.ugoira.convert_to_gif;
+        mp4.checked = result.ugoira.convert_to_mp4;
+        ffmpegStatus.className = `alert mt-3 alert-${result.ffmpeg.available ? 'success' : 'warning'}`;
+        ffmpegStatus.textContent = result.ffmpeg.message;
+        ffmpegDownload.href = result.ffmpeg.download_url;
+        ffmpegDownload.classList.toggle('d-none', result.ffmpeg.available);
+    };
+    const showFeedback = (kind, message) => {
+        feedback.className = `alert alert-${kind} mt-3`;
+        feedback.textContent = message;
+    };
+
+    ugoiraForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const values = payload();
+        if (!Object.values(values).some(Boolean)) {
+            showFeedback('danger', '请至少选择一种动图保存格式。');
+            return;
+        }
+        save.disabled = true;
+        try {
+            const response = await fetch('/api/ugoira', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(values),
+            });
+            const result = await response.json();
+            if (!response.ok) throw new Error(result.error || '动图设置保存失败。');
+            renderSettings(result);
+            showFeedback('success', '动图设置已保存。');
+        } catch (error) {
+            showFeedback('danger', error.message);
+        } finally {
+            save.disabled = false;
+        }
+    });
+
+    fetch('/api/ugoira')
+        .then(async (response) => {
+            const result = await response.json();
+            if (!response.ok) throw new Error(result.error || '动图设置加载失败。');
+            return result;
+        })
+        .then(renderSettings)
+        .catch((error) => showFeedback('danger', error.message));
+}
+
 const taskList = document.getElementById('task-list');
 const taskListFeedback = document.getElementById('task-list-feedback');
 const liveTaskProgress = new Map();

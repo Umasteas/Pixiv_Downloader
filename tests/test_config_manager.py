@@ -48,3 +48,28 @@ def test_update_setting():
         # 验证持久化
         cm2 = ConfigManager(str(config_path))
         assert cm2.get_setting('download', 'max_concurrent') == 20
+
+
+def test_save_config_keeps_previous_file_when_serialization_fails(
+    tmp_path,
+    monkeypatch,
+):
+    """正式配置只能在完整临时文件写入成功后替换。"""
+    from src.pixiv_downloader import config_manager as config_module
+
+    config_path = tmp_path / "config.yaml"
+    manager = ConfigManager(str(config_path))
+    baseline = config_path.read_bytes()
+    manager.config["ugoira"]["convert_to_gif"] = True
+
+    def interrupted_dump(data, stream, **options):
+        stream.write("partial: true\n")
+        raise RuntimeError("simulated write interruption")
+
+    monkeypatch.setattr(config_module.yaml, "dump", interrupted_dump)
+
+    with pytest.raises(RuntimeError, match="simulated write interruption"):
+        manager.save_config()
+
+    assert config_path.read_bytes() == baseline
+    assert list(tmp_path.glob(".config.yaml.*.tmp")) == []

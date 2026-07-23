@@ -20,6 +20,12 @@
             {{ startup_connectivity.message }} 请在下方检查或配置代理。
         </div>
         {% endif %}
+        {% if startup_ffmpeg and not startup_ffmpeg.available %}
+        <div id="startup-ffmpeg-alert" class="alert alert-warning" role="alert">
+            {{ startup_ffmpeg.message }}
+            <a href="{{ startup_ffmpeg.download_url }}" target="_blank" rel="noopener noreferrer">下载 ffmpeg</a>
+        </div>
+        {% endif %}
         {% if needs_setup %}
         <div id="setup-wizard" class="row g-4">
             <div class="col-lg-5">
@@ -230,6 +236,23 @@
                     </div>
                 </form>
                 <div id="proxy-feedback" class="alert mt-3 d-none" role="alert"></div>
+            </div>
+        </section>
+        <section id="ugoira-settings" class="card mt-4">
+            <div class="card-body">
+                <h2 class="h4">动图处理</h2>
+                <p class="text-muted">可叠加选择多个输出格式；转换失败时会保留原始 ZIP。</p>
+                <form id="ugoira-form">
+                    <div class="d-flex flex-wrap gap-3">
+                        <label><input id="ugoira-download-original" class="form-check-input" type="checkbox"> 保留原始 ZIP</label>
+                        <label><input id="ugoira-convert-gif" class="form-check-input" type="checkbox"> 转换为 GIF</label>
+                        <label><input id="ugoira-convert-mp4" class="form-check-input" type="checkbox"> 转换为 MP4</label>
+                    </div>
+                    <button id="ugoira-save" class="btn btn-primary mt-3" type="submit">保存动图设置</button>
+                </form>
+                <div id="ugoira-ffmpeg-status" class="alert mt-3 d-none" role="status"></div>
+                <a id="ugoira-ffmpeg-download" class="d-none" href="https://ffmpeg.org/download.html" target="_blank" rel="noopener noreferrer">下载 ffmpeg</a>
+                <div id="ugoira-feedback" class="alert mt-3 d-none" role="alert"></div>
             </div>
         </section>
     </div>

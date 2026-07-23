@@ -1,5 +1,6 @@
 """配置管理模块"""
 import os
+import tempfile
 import yaml
 from pathlib import Path
 from typing import Any, Dict
@@ -54,9 +55,7 @@ class ConfigManager:
                 return self._merge_with_defaults(config)
         else:
             # 创建默认配置文件
-            self.config_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.config_path, 'w', encoding='utf-8') as f:
-                yaml.dump(DEFAULT_CONFIG, f, allow_unicode=True, default_flow_style=False)
+            self._write_config(DEFAULT_CONFIG)
             return copy.deepcopy(DEFAULT_CONFIG)
     
     def _merge_with_defaults(self, config: Dict[str, Any]) -> Dict[str, Any]:
@@ -77,8 +76,34 @@ class ConfigManager:
     
     def save_config(self) -> None:
         """保存配置到文件"""
-        with open(self.config_path, 'w', encoding='utf-8') as f:
-            yaml.dump(self.config, f, allow_unicode=True, default_flow_style=False)
+        self._write_config(self.config)
+
+    def _write_config(self, config: Dict[str, Any]) -> None:
+        """同目录写完整临时文件，再原子替换正式配置。"""
+        self.config_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self.config_path.parent,
+                prefix=f".{self.config_path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as stream:
+                temporary_path = Path(stream.name)
+                yaml.dump(
+                    config,
+                    stream,
+                    allow_unicode=True,
+                    default_flow_style=False,
+                )
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary_path, self.config_path)
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
     
     def get_setting(self, section: str, key: str, default: Any = None) -> Any:
         """获取单个配置项"""

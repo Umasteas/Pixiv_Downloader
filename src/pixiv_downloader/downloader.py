@@ -20,6 +20,12 @@ from .errors import (
 )
 from .filters import filter_artworks
 from .rate_limiter import AdaptiveLimiter
+from .ugoira import (
+    check_ffmpeg,
+    convert_to_gif,
+    convert_to_mp4,
+    parse_ugoira_frames,
+)
 
 from .file_organizer import (
     get_artwork_directory,
@@ -91,6 +97,10 @@ class ArtistDownloader:
         session_factory: Callable[..., Any] = aiohttp.ClientSession,
         policy: DownloadPolicy | None = None,
         sleep: Callable[[float], Any] = asyncio.sleep,
+        ugoira_options: dict[str, Any] | None = None,
+        gif_converter=convert_to_gif,
+        mp4_converter=convert_to_mp4,
+        ffmpeg_checker=check_ffmpeg,
     ) -> None:
         self.api = api
         self.database = database
@@ -99,6 +109,16 @@ class ArtistDownloader:
         self.session_factory = session_factory
         self.policy = policy or DownloadPolicy()
         self.sleep = sleep
+        self.ugoira_options = {
+            "download_original": True,
+            "convert_to_gif": False,
+            "convert_to_mp4": True,
+            "ffmpeg_path": "auto",
+            **(ugoira_options or {}),
+        }
+        self.gif_converter = gif_converter
+        self.mp4_converter = mp4_converter
+        self.ffmpeg_checker = ffmpeg_checker
 
     def fetch_artist_artworks(self, artist_id: int) -> list[Any]:
         """读取画师的全部作品分页。"""
@@ -248,7 +268,17 @@ class ArtistDownloader:
         if self.database.is_downloaded(artwork_id):
             return "skipped"
 
-        if page_count > 1:
+        if _field(artwork, "type") == "ugoira":
+            save_path, metadata_path, file_size = await self._download_ugoira(
+                artwork,
+                session=session,
+                request_options=request_options,
+                progress=progress,
+                limiter=limiter,
+                control=control,
+                task_id=task_id,
+            )
+        elif page_count > 1:
             urls = self._original_image_urls(artwork)
             save_path = get_artwork_directory(self.output_dir, artwork)
             page_paths = [
@@ -321,6 +351,115 @@ class ArtistDownloader:
             metadata_path.unlink(missing_ok=True)
             raise
         return "downloaded"
+
+    async def download_ugoira_zip(
+        self,
+        artwork_id: int,
+        save_path: Path | str,
+        *,
+        session=None,
+        request_options: dict[str, Any] | None = None,
+        progress=None,
+        limiter=None,
+        control=None,
+        task_id: int | None = None,
+    ) -> list[Any]:
+        """获取 Pixiv Ugoira 元数据，下载 ZIP，并验证帧与延迟。"""
+        response = self.api.ugoira_metadata(int(artwork_id))
+        metadata = _field(response, "ugoira_metadata", {}) or {}
+        zip_urls = _field(metadata, "zip_urls", {}) or {}
+        url = _field(zip_urls, "medium")
+        frames = _field(metadata, "frames", []) or []
+        if not url:
+            raise DownloadError("Ugoira 元数据缺少 ZIP 地址。")
+        await self.download_file(
+            str(url),
+            save_path,
+            session=session,
+            request_options=request_options,
+            progress=progress,
+            limiter=limiter,
+            control=control,
+            task_id=task_id,
+            artwork_id=artwork_id,
+        )
+        parse_ugoira_frames(save_path, frames)
+        return list(frames)
+
+    async def _download_ugoira(
+        self,
+        artwork: Any,
+        *,
+        session,
+        request_options,
+        progress,
+        limiter,
+        control,
+        task_id,
+    ) -> tuple[Path, Path, int]:
+        options = self.ugoira_options
+        selected = any(
+            bool(options.get(key))
+            for key in ("download_original", "convert_to_gif", "convert_to_mp4")
+        )
+        if not selected:
+            raise DownloadError("Ugoira 至少需要选择一种保存格式。")
+        artwork_id = int(_field(artwork, "id"))
+        artwork_dir = get_artwork_directory(self.output_dir, artwork)
+        archive_path = artwork_dir / "ugoira.zip"
+        frames = await self.download_ugoira_zip(
+            artwork_id,
+            archive_path,
+            session=session,
+            request_options=request_options,
+            progress=progress,
+            limiter=limiter,
+            control=control,
+            task_id=task_id,
+        )
+        conversion_failed = False
+        if options.get("convert_to_gif"):
+            try:
+                self.gif_converter(archive_path, frames, artwork_dir / "ugoira.gif")
+            except Exception:
+                conversion_failed = True
+                logger.warning("Ugoira GIF 转换失败，已保留 ZIP：artwork_id=%s", artwork_id)
+        if options.get("convert_to_mp4"):
+            status = self.ffmpeg_checker(str(options.get("ffmpeg_path", "auto")))
+            if status.available and status.path:
+                try:
+                    self.mp4_converter(
+                        archive_path,
+                        frames,
+                        artwork_dir / "ugoira.mp4",
+                        ffmpeg_path=status.path,
+                    )
+                except Exception:
+                    conversion_failed = True
+                    logger.warning(
+                        "Ugoira MP4 转换失败，已保留 ZIP：artwork_id=%s",
+                        artwork_id,
+                    )
+            else:
+                conversion_failed = True
+                logger.warning(
+                    "Ugoira MP4 转换跳过，未检测到 ffmpeg，已保留 ZIP：artwork_id=%s",
+                    artwork_id,
+                )
+        if not options.get("download_original") and not conversion_failed:
+            archive_path.unlink()
+        files = [
+            path
+            for path in (
+                archive_path,
+                artwork_dir / "ugoira.gif",
+                artwork_dir / "ugoira.mp4",
+            )
+            if path.is_file()
+        ]
+        return artwork_dir, artwork_dir / "metadata.json", sum(
+            path.stat().st_size for path in files
+        )
 
     async def download_artist(
         self,

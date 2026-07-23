@@ -44,8 +44,18 @@ def test_execute_download_task_passes_runtime_download_policy(monkeypatch, tmp_p
     captured = {}
 
     class Downloader:
-        def __init__(self, api, database, proxy, *, output_dir, policy):
+        def __init__(
+            self,
+            api,
+            database,
+            proxy,
+            *,
+            output_dir,
+            policy,
+            ugoira_options,
+        ):
             captured["policy"] = policy
+            captured["ugoira"] = ugoira_options
 
         async def download_artist(self, artist_id, **options):
             captured["artist_id"] = artist_id
@@ -65,7 +75,13 @@ def test_execute_download_task_passes_runtime_download_policy(monkeypatch, tmp_p
                 "max_concurrent": 2,
                 "retry_times": 4,
                 "retry_delays": [0.25, 1],
-            }
+            },
+            "ugoira": {
+                "download_original": False,
+                "convert_to_gif": True,
+                "convert_to_mp4": True,
+                "ffmpeg_path": "C:/tools/ffmpeg.exe",
+            },
         },
     )
     monkeypatch.setattr(
@@ -90,6 +106,12 @@ def test_execute_download_task_passes_runtime_download_policy(monkeypatch, tmp_p
     assert captured["policy"].max_concurrent == 2
     assert captured["policy"].retry_times == 4
     assert captured["policy"].retry_delays == (0.25, 1.0, 1.0, 1.0)
+    assert captured["ugoira"] == {
+        "download_original": False,
+        "convert_to_gif": True,
+        "convert_to_mp4": True,
+        "ffmpeg_path": "C:/tools/ffmpeg.exe",
+    }
 
 
 def test_project_skeleton_and_dependencies_exist():
@@ -284,6 +306,32 @@ def test_startup_connectivity_failure_is_visible_in_web_ui(monkeypatch):
     assert "Pixiv 连接失败，请检查网络或代理设置。" in page
 
 
+def test_start_app_exposes_missing_ffmpeg_install_hint(monkeypatch, capsys):
+    from src.pixiv_downloader.ugoira import FFMPEG_DOWNLOAD_URL, FFmpegStatus
+
+    _stub_successful_connectivity(monkeypatch)
+    monkeypatch.setattr(app_module.socketio, "run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        app_module,
+        "check_ffmpeg",
+        lambda path: FFmpegStatus(
+            False,
+            None,
+            "未检测到 ffmpeg，MP4 转换不可用。",
+        ),
+        raising=False,
+    )
+
+    app_module.start_app(port=54325, auto_open=False)
+    page = app_module.app.test_client().get(
+        f"/?token={app_module.SECURITY_TOKEN}"
+    ).get_data(as_text=True)
+
+    assert "未检测到 ffmpeg，MP4 转换不可用。" in capsys.readouterr().out
+    assert 'id="startup-ffmpeg-alert"' in page
+    assert FFMPEG_DOWNLOAD_URL in page
+
+
 def test_app_initializes_history_database_and_required_tables():
     from src.pixiv_downloader.database import DatabaseManager
 
@@ -413,6 +461,133 @@ def test_config_api_rejects_proxy_updates_that_bypass_validation(tmp_path, monke
         "error": "代理配置必须通过专用代理接口校验并保存"
     }
     assert config.config["proxy"]["type"] == "none"
+
+
+def test_ugoira_settings_api_validates_persists_and_reports_ffmpeg(tmp_path, monkeypatch):
+    from src.pixiv_downloader.config_manager import ConfigManager
+    from src.pixiv_downloader.ugoira import FFmpegStatus
+
+    config = ConfigManager(str(tmp_path / "config.yaml"))
+    monkeypatch.setattr(app_module, "config_manager", config)
+    monkeypatch.setattr(
+        app_module,
+        "check_ffmpeg",
+        lambda path: FFmpegStatus(False, None, "未检测到 ffmpeg，MP4 转换不可用。"),
+    )
+    client = app_module.app.test_client()
+
+    initial = client.get("/api/ugoira")
+    invalid = client.post("/api/ugoira", json={
+        "download_original": False,
+        "convert_to_gif": False,
+        "convert_to_mp4": False,
+    })
+    saved = client.post("/api/ugoira", json={
+        "download_original": False,
+        "convert_to_gif": True,
+        "convert_to_mp4": True,
+    })
+
+    assert initial.status_code == 200
+    assert initial.get_json()["ugoira"]["download_original"] is True
+    assert initial.get_json()["ffmpeg"] == {
+        "available": False,
+        "message": "未检测到 ffmpeg，MP4 转换不可用。",
+        "download_url": "https://ffmpeg.org/download.html",
+    }
+    assert invalid.status_code == 400
+    assert "至少选择一种" in invalid.get_json()["error"]
+    assert saved.status_code == 200
+    persisted = ConfigManager(str(tmp_path / "config.yaml")).config["ugoira"]
+    assert persisted == {
+        "download_original": False,
+        "convert_to_gif": True,
+        "convert_to_mp4": True,
+        "ffmpeg_path": "auto",
+    }
+
+
+def test_ugoira_api_does_not_expose_local_ffmpeg_paths(tmp_path, monkeypatch):
+    from src.pixiv_downloader.config_manager import ConfigManager
+    from src.pixiv_downloader.ugoira import FFmpegStatus
+
+    config = ConfigManager(str(tmp_path / "config.yaml"))
+    config.config["ugoira"]["ffmpeg_path"] = "C:/private/configured/ffmpeg.exe"
+    config.save_config()
+    monkeypatch.setattr(app_module, "config_manager", config)
+    monkeypatch.setattr(
+        app_module,
+        "check_ffmpeg",
+        lambda path: FFmpegStatus(
+            True,
+            "C:/private/resolved/ffmpeg.exe",
+            "ffmpeg 可用，可转换 MP4。",
+        ),
+    )
+
+    response = app_module.app.test_client().get("/api/ugoira")
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["ugoira"] == {
+        "download_original": True,
+        "convert_to_gif": False,
+        "convert_to_mp4": True,
+    }
+    assert payload["ffmpeg"] == {
+        "available": True,
+        "message": "ffmpeg 可用，可转换 MP4。",
+        "download_url": "https://ffmpeg.org/download.html",
+    }
+    assert "C:/private" not in response.get_data(as_text=True)
+
+
+def test_generic_config_api_cannot_bypass_ugoira_validation(tmp_path, monkeypatch):
+    from src.pixiv_downloader.config_manager import ConfigManager
+
+    config = ConfigManager(str(tmp_path / "config.yaml"))
+    monkeypatch.setattr(app_module, "config_manager", config)
+
+    response = app_module.app.test_client().post("/api/config", json={
+        "ugoira": {
+            "download_original": False,
+            "convert_to_gif": False,
+            "convert_to_mp4": False,
+        },
+    })
+
+    assert response.status_code == 400
+    assert response.get_json() == {
+        "error": "动图配置必须通过专用接口校验并保存"
+    }
+    assert config.config["ugoira"]["download_original"] is True
+
+
+def test_ugoira_settings_ui_exposes_three_stackable_formats_and_ffmpeg_hint(monkeypatch):
+    from src.pixiv_downloader.ugoira import FFMPEG_DOWNLOAD_URL
+
+    monkeypatch.setattr(app_module, "auth_manager", StubAuthManager(configured=True))
+    page = app_module.app.test_client().get(
+        f"/?token={app_module.SECURITY_TOKEN}"
+    ).get_data(as_text=True)
+    script = (PROJECT_ROOT / "static" / "app.js").read_text(encoding="utf-8")
+
+    for element_id in (
+        "ugoira-settings",
+        "ugoira-form",
+        "ugoira-download-original",
+        "ugoira-convert-gif",
+        "ugoira-convert-mp4",
+        "ugoira-save",
+        "ugoira-ffmpeg-status",
+        "ugoira-ffmpeg-download",
+        "ugoira-feedback",
+    ):
+        assert f'id="{element_id}"' in page
+    assert FFMPEG_DOWNLOAD_URL in page
+    assert "fetch('/api/ugoira')" in script
+    assert "fetch('/api/ugoira'," in script
+    assert "ugoiraForm.addEventListener('submit'" in script
 
 
 def test_proxy_api_saves_validated_yaml_and_masks_password(tmp_path, monkeypatch):

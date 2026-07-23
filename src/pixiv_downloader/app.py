@@ -18,6 +18,7 @@ from .logging_setup import configure_logging
 from .proxy import ProxyConfigError, ProxyManager
 from .runtime import runtime_paths
 from .task_manager import TaskManager, TaskManagerError
+from .ugoira import check_ffmpeg
 
 RUNTIME_PATHS = runtime_paths()
 app = Flask(
@@ -71,7 +72,9 @@ def _execute_download_task(task, control):
     auth_manager.get_access_token()
     if auth_manager.api is None:
         raise AuthError("Pixiv 登录状态不可用")
-    download_config = config_manager.load_config().get("download", {})
+    runtime_config = config_manager.load_config()
+    download_config = runtime_config.get("download", {})
+    ugoira_config = runtime_config.get("ugoira", {})
     policy = DownloadPolicy.from_mapping(download_config)
     configured_output = Path(download_config.get("output_dir", "./downloads"))
     output_dir = (
@@ -89,6 +92,7 @@ def _execute_download_task(task, control):
         proxy_manager,
         output_dir=output_dir.resolve(),
         policy=policy,
+        ugoira_options=ugoira_config,
     )
     options = {
         "task_id": task["task_id"],
@@ -120,6 +124,7 @@ task_manager = TaskManager(
 # 生成随机 token 用于 URL
 SECURITY_TOKEN = secrets.token_urlsafe(16)
 startup_connectivity = None
+startup_ffmpeg = None
 tray_icon = None
 
 @app.route('/')
@@ -132,6 +137,7 @@ def index():
         'index.html',
         needs_setup=not auth_manager.has_saved_token(),
         startup_connectivity=startup_connectivity,
+        startup_ffmpeg=startup_ffmpeg,
     )
 
 @app.route('/api/auth/status', methods=['GET'])
@@ -183,6 +189,10 @@ def update_config():
         return jsonify({
             "error": "代理配置必须通过专用代理接口校验并保存"
         }), 400
+    if "ugoira" in data:
+        return jsonify({
+            "error": "动图配置必须通过专用接口校验并保存"
+        }), 400
     
     for section, values in data.items():
         if isinstance(values, dict):
@@ -196,6 +206,46 @@ def update_config():
         )
     
     return jsonify({"success": True})
+
+
+def _ffmpeg_payload(status):
+    return {
+        "available": status.available,
+        "message": status.message,
+        "download_url": status.download_url,
+    }
+
+
+def _public_ugoira_settings(settings):
+    return {
+        key: bool(settings.get(key))
+        for key in ("download_original", "convert_to_gif", "convert_to_mp4")
+    }
+
+
+@app.route('/api/ugoira', methods=['GET', 'POST'])
+def ugoira_settings():
+    """读取或原子保存三个可叠加 Ugoira 输出选项。"""
+    keys = ("download_original", "convert_to_gif", "convert_to_mp4")
+    if request.method == 'POST':
+        data = request.get_json(silent=True)
+        if (
+            not isinstance(data, dict)
+            or set(data) != set(keys)
+            or any(type(data[key]) is not bool for key in keys)
+        ):
+            return jsonify({"error": "Ugoira 设置必须包含三个布尔选项。"}), 400
+        if not any(data.values()):
+            return jsonify({"error": "Ugoira 至少选择一种保存格式。"}), 400
+        config_manager.config.setdefault("ugoira", {}).update(data)
+        config_manager.save_config()
+    settings = config_manager.load_config().get("ugoira", {})
+    status = check_ffmpeg(str(settings.get("ffmpeg_path", "auto")))
+    return jsonify({
+        "success": True,
+        "ugoira": _public_ugoira_settings(settings),
+        "ffmpeg": _ffmpeg_payload(status),
+    })
 
 
 def _public_proxy_settings(settings):
@@ -465,7 +515,7 @@ def start_app(
     tray_factory=None,
 ):
     """启动应用"""
-    global startup_connectivity, tray_icon
+    global startup_connectivity, startup_ffmpeg, tray_icon
     url = f'http://{host}:{port}?token={SECURITY_TOKEN}'
     print(f'Starting Pixiv Downloader...')
     print(f'Access URL: {url}')
@@ -478,6 +528,10 @@ def start_app(
     print(connectivity_message)
     if not reachable:
         print('无法连接到Pixiv，请在设置页面配置代理后重试。')
+
+    ugoira_config = config_manager.load_config().get("ugoira", {})
+    startup_ffmpeg = check_ffmpeg(str(ugoira_config.get("ffmpeg_path", "auto")))
+    print(startup_ffmpeg.message)
 
     if auth_manager.has_saved_token():
         try:
