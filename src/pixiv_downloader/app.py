@@ -1,13 +1,29 @@
 """Flask 应用主入口"""
-import asyncio
-import webbrowser
-import secrets
-import copy
 import atexit
+import asyncio
+import copy
+import os
+import secrets
+import stat
+import webbrowser
 from datetime import date
 from pathlib import Path
-from flask import Flask, render_template, jsonify, request
+
+from flask import Flask, render_template, jsonify, request, send_file
 from flask_socketio import SocketIO
+
+from .archives import (
+    ArchiveError,
+    ArchiveIOError,
+    InsufficientDiskSpace,
+    _archive_filename,
+    archive_transaction,
+    create_task_archive_unlocked,
+    delete_archive_sources,
+    open_regular_file,
+    recover_task_archive,
+    rollback_task_archive,
+)
 from .auth import AuthError, AuthManager
 from .bookmarks import (
     BookmarksValidationError,
@@ -61,6 +77,17 @@ database_manager = DatabaseManager(RUNTIME_PATHS.database_file)
 atexit.register(database_manager.close)
 
 
+def _download_output_dir(config):
+    """把配置中的相对下载目录稳定解析到便携应用目录。"""
+    download_config = config.get("download", {})
+    configured = Path(download_config.get("output_dir", "./downloads"))
+    return (
+        configured
+        if configured.is_absolute()
+        else RUNTIME_PATHS.application_dir / configured
+    ).resolve()
+
+
 def _execute_download_task(task, control):
     """执行持久化下载任务，并从已完成的连续前缀恢复。"""
     query = task.get("query")
@@ -109,12 +136,7 @@ def _execute_download_task(task, control):
     download_config = runtime_config.get("download", {})
     ugoira_config = runtime_config.get("ugoira", {})
     policy = DownloadPolicy.from_mapping(download_config)
-    configured_output = Path(download_config.get("output_dir", "./downloads"))
-    output_dir = (
-        configured_output
-        if configured_output.is_absolute()
-        else RUNTIME_PATHS.application_dir / configured_output
-    )
+    output_dir = _download_output_dir(runtime_config)
     processed = sum(
         int(task.get(key) or 0)
         for key in ("downloaded_count", "skipped_count", "failed_count")
@@ -217,7 +239,68 @@ def _publish_task_event(event, payload):
     socketio.emit(event, payload)
 
 
-def _public_task(task):
+def _safe_task_archive(task, record=None):
+    """只公开数据库记录中仍为下载根内普通文件的已完成归档。"""
+    record = record if record is not None else database_manager.get_task_archive(task["task_id"])
+    if record is None or record.get("status") != "complete":
+        return None
+    if not record or not record.get("file_count"):
+        return None
+    filename = str(record.get("filename") or "")
+    if Path(filename).name != filename or not filename.lower().endswith(".zip"):
+        return None
+    try:
+        root = _download_output_dir(config_manager.load_config())
+        path = root / filename
+        root_stat = os.lstat(root)
+        file_stat = os.lstat(path)
+        if (stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode)
+                or stat.S_ISLNK(file_stat.st_mode) or not stat.S_ISREG(file_stat.st_mode)):
+            return None
+        path.resolve(strict=True).relative_to(root)
+        file_count = int(record["file_count"])
+        file_size = int(record["file_size"])
+        deleted_value = int(record["deleted_originals"])
+        deleted_count = int(record.get("deleted_original_count") or 0)
+        failed_count = int(record.get("delete_failed_count") or 0)
+        if (
+            file_count <= 0
+            or file_size < 0
+            or file_stat.st_size != file_size
+            or deleted_value not in {0, 1}
+            or deleted_count < 0
+            or failed_count < 0
+        ):
+            return None
+        public_archive = {
+            "filename": filename,
+            "file_count": file_count,
+            "file_size": file_size,
+            "deleted_originals": bool(deleted_value),
+            "deleted_original_count": deleted_count,
+            "delete_failed_count": failed_count,
+            "delete_warning": "部分原文件删除失败。" if failed_count else None,
+            "download_url": f"/api/archives/{filename}",
+        }
+    except (KeyError, OSError, TypeError, ValueError):
+        return None
+    return public_archive
+
+
+def _rollback_archive_attempt(task_id, result):
+    """尽力移除未提交 ZIP 并标记失败，不让清理异常覆盖 API JSON。"""
+    if result is not None:
+        try:
+            rollback_task_archive(result)
+        except (ArchiveError, KeyError, OSError, TypeError):
+            pass
+    try:
+        database_manager.fail_task_archive(task_id)
+    except Exception:
+        pass
+
+
+def _public_task(task, archive_record=None):
     """投影可公开给前端的任务字段，隐藏内部候选快照与私密标签。"""
     result = dict(task)
     query = task.get("query")
@@ -232,6 +315,10 @@ def _public_task(task):
         public_query["tag_redacted"] = public_query.get("tag") is not None
         public_query["tag"] = None
     result["query"] = public_query
+    if task.get("status") == "completed":
+        archive = _safe_task_archive(task, archive_record)
+        if archive is not None:
+            result["archive"] = archive
     return result
 
 
@@ -530,8 +617,12 @@ def get_download_stats():
 @app.route('/api/tasks', methods=['GET'])
 def get_tasks():
     """获取任务列表"""
+    tasks = task_manager.list_tasks()
+    archives = database_manager.list_task_archives(
+        task["task_id"] for task in tasks
+    )
     return jsonify({"tasks": [
-        _public_task(task) for task in task_manager.list_tasks()
+        _public_task(task, archives.get(task["task_id"])) for task in tasks
     ]})
 
 
@@ -541,14 +632,259 @@ def get_task_detail(task_id):
     task = database_manager.get_task(task_id)
     if task is None:
         return jsonify({"success": False, "error": "任务不存在。"}), 404
+    archive = (
+        database_manager.get_task_archive(task_id)
+        if task.get("status") == "completed"
+        else None
+    )
     return jsonify({
         "success": True,
-        "task": _public_task(task),
+        "task": _public_task(task, archive),
         "failed_artworks": _public_task_failures(
             task,
             database_manager.list_task_failures(task_id),
         ),
     })
+
+
+@app.route('/api/tasks/<int:task_id>/archive', methods=['POST'])
+def archive_task(task_id):
+    """把已完成任务仍归属的下载文件打包为 ZIP。"""
+    if not secrets.compare_digest(
+        request.headers.get("X-App-Token", ""),
+        SECURITY_TOKEN,
+    ):
+        return jsonify({"success": False, "error": "无权创建任务归档。"}), 403
+    data = request.get_json(silent=True)
+    if data is None:
+        data = {}
+    delete_originals = data.get("delete_originals", False) if isinstance(data, dict) else None
+    if type(delete_originals) is not bool:
+        return jsonify({
+            "success": False,
+            "error": "delete_originals 必须是布尔值。",
+        }), 400
+    result = None
+    reserved = False
+    committed = False
+    try:
+        output_dir = _download_output_dir(config_manager.load_config())
+        with archive_transaction(output_dir) as root:
+            task = database_manager.get_task(task_id)
+            if task is None:
+                return jsonify({"success": False, "error": "任务不存在。"}), 404
+            if task["status"] != "completed":
+                return jsonify({
+                    "success": False,
+                    "error": "只能打包已完成任务。",
+                }), 409
+            records = database_manager.list_task_downloads(task_id)
+            existing = database_manager.get_task_archive(task_id)
+            if existing and existing.get("status") == "complete":
+                archive = _safe_task_archive(task, existing)
+                if archive is not None:
+                    if delete_originals and not archive["deleted_originals"]:
+                        return jsonify({
+                            "success": False,
+                            "error": "归档已存在，不能事后删除原文件。",
+                        }), 409
+                    return jsonify({"success": True, "archive": archive})
+                existing_filename = str(existing.get("filename") or "")
+                if (
+                    Path(existing_filename).name != existing_filename
+                    or not existing_filename.lower().endswith(".zip")
+                ):
+                    return jsonify({
+                        "success": False,
+                        "error": "归档记录损坏，不能自动重建。",
+                    }), 409
+                try:
+                    os.lstat(root / existing_filename)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    return jsonify({
+                        "success": False,
+                        "error": "归档文件状态异常，不能自动重建。",
+                    }), 409
+                else:
+                    return jsonify({
+                        "success": False,
+                        "error": "归档文件与记录不一致，不能自动重建。",
+                    }), 409
+                database_manager.fail_task_archive(task_id)
+                existing = database_manager.get_task_archive(task_id)
+            if existing and existing.get("status") in {"reserved", "failed"}:
+                recovered = recover_task_archive(task, existing, records, root)
+                if recovered is not None:
+                    stored = database_manager.complete_task_archive(
+                        task_id,
+                        filename=recovered["filename"],
+                        file_count=recovered["file_count"],
+                        file_size=recovered["file_size"],
+                        deleted_originals=False,
+                        deleted_original_count=0,
+                        delete_failed_count=0,
+                    )
+                    if stored is not None:
+                        archive = _safe_task_archive(task, stored)
+                        if archive is not None:
+                            if delete_originals:
+                                return jsonify({
+                                    "success": False,
+                                    "error": "已恢复归档，不能事后删除原文件。",
+                                }), 409
+                            return jsonify({"success": True, "archive": archive})
+                reserved_filename = str(existing.get("filename") or "")
+                if (
+                    Path(reserved_filename).name != reserved_filename
+                    or not reserved_filename.lower().endswith(".zip")
+                ):
+                    return jsonify({
+                        "success": False,
+                        "error": "归档预留记录损坏，不能自动重建。",
+                    }), 409
+                try:
+                    os.lstat(root / reserved_filename)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    return jsonify({
+                        "success": False,
+                        "error": "归档预留文件状态异常，不能自动重建。",
+                    }), 409
+                else:
+                    return jsonify({
+                        "success": False,
+                        "error": "归档预留文件校验失败，不能自动重建。",
+                    }), 409
+            unavailable = {
+                entry.name
+                for entry in os.scandir(root)
+                if entry.name.lower().endswith(".zip")
+            }
+            filename = database_manager.reserve_task_archive(
+                task_id,
+                _archive_filename(task),
+                unavailable,
+            )
+            reserved = True
+            reservation = database_manager.get_task_archive(task_id)
+            recovery_token = str((reservation or {}).get("recovery_token") or "")
+            if len(recovery_token) != 64:
+                raise ArchiveIOError("归档恢复凭据保存失败。")
+
+            def publish_progress(current, total, _filename):
+                socketio.emit("archive_progress", {
+                    "task_id": task_id,
+                    "current": current,
+                    "total": total,
+                })
+
+            result = create_task_archive_unlocked(
+                task,
+                records,
+                root,
+                progress=publish_progress,
+                delete_originals=False,
+                filename=filename,
+                recovery_token=recovery_token,
+            )
+            stored = database_manager.complete_task_archive(
+                task_id,
+                filename=result["filename"],
+                file_count=result["file_count"],
+                file_size=result["file_size"],
+                deleted_originals=False,
+                deleted_original_count=0,
+                delete_failed_count=0,
+            )
+            if stored is None:
+                raise ArchiveIOError("归档记录保存失败。")
+            committed = True
+            if delete_originals:
+                delete_archive_sources(result)
+                deletion_record = database_manager.update_task_archive_deletion(
+                    task_id,
+                    deleted_originals=result["deleted_originals"],
+                    deleted_original_count=result["deleted_original_count"],
+                    delete_failed_count=result["delete_failed_count"],
+                )
+                if deletion_record is None:
+                    result["delete_warning"] = "原文件删除结果未能保存。"
+    except InsufficientDiskSpace as exc:
+        if reserved and not committed:
+            _rollback_archive_attempt(task_id, result)
+        return jsonify({"success": False, "error": str(exc)}), 507
+    except ArchiveIOError:
+        if reserved and not committed:
+            _rollback_archive_attempt(task_id, result)
+        return jsonify({"success": False, "error": "归档文件操作失败。"}), 500
+    except ArchiveError as exc:
+        if reserved and not committed:
+            _rollback_archive_attempt(task_id, result)
+        return jsonify({"success": False, "error": str(exc)}), 409
+    except OSError as exc:
+        if reserved and not committed:
+            _rollback_archive_attempt(task_id, result)
+        if getattr(exc, "errno", None) == 28:
+            return jsonify({"success": False, "error": "磁盘空间不足，无法创建任务归档。"}), 507
+        return jsonify({"success": False, "error": "归档文件操作失败。"}), 500
+    except Exception:
+        if reserved and not committed:
+            _rollback_archive_attempt(task_id, result)
+        return jsonify({"success": False, "error": "归档创建失败。"}), 500
+    archive = {
+        key: result[key] for key in ("filename", "file_count", "file_size", "deleted_originals")
+    }
+    if result.get("delete_failed_count") or delete_originals:
+        archive.update({
+            "deleted_original_count": result.get("deleted_original_count", 0),
+            "delete_failed_count": result.get("delete_failed_count", 0),
+            "delete_warning": result.get("delete_warning"),
+        })
+    archive["download_url"] = f"/api/archives/{result['filename']}"
+    return jsonify({"success": True, "archive": archive})
+
+
+@app.route('/api/archives/<filename>', methods=['GET'])
+def download_archive(filename):
+    """经应用 token 验证后，以安全打开的文件对象下载 ZIP。"""
+    if not secrets.compare_digest(
+        request.headers.get("X-App-Token", ""), SECURITY_TOKEN,
+    ):
+        return jsonify({"success": False, "error": "无权下载任务归档。"}), 403
+    if Path(filename).name != filename or not filename.lower().endswith(".zip"):
+        return jsonify({"success": False, "error": "归档文件名无效。"}), 400
+    try:
+        archive_record = database_manager.get_task_archive_by_filename(filename)
+        if archive_record is None:
+            raise FileNotFoundError(filename)
+        root = _download_output_dir(config_manager.load_config())
+        path = root / filename
+        stream, identity = open_regular_file(path, root)
+        expected_size = int(archive_record["file_size"])
+        if identity.st_size != expected_size:
+            stream.close()
+            raise OSError("archive changed")
+        try:
+            response = send_file(
+                stream,
+                as_attachment=True,
+                download_name=filename,
+                mimetype="application/zip",
+            )
+        except Exception:
+            stream.close()
+            raise
+        response.call_on_close(stream.close)
+        return response
+    except (ArchiveError, FileNotFoundError, PermissionError):
+        return jsonify({"success": False, "error": "归档文件不存在或不可用。"}), 404
+    except OSError:
+        return jsonify({"success": False, "error": "归档文件不可用。"}), 500
+    except Exception:
+        return jsonify({"success": False, "error": "归档文件不可用。"}), 500
 
 
 @app.route('/api/tasks/<int:task_id>/retry-failed', methods=['POST'])

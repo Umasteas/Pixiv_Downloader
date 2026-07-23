@@ -250,6 +250,14 @@ const taskActions = {
     paused: [['resume', '恢复'], ['cancel', '取消']],
 };
 const taskDetailCache = new Map();
+const archiveUi = ArchiveUI({
+    documentRef: document,
+    urlApi: URL,
+    scheduler: (callback, delay) => setTimeout(callback, delay),
+});
+const archiveProgress = archiveUi.progress;
+const taskArchives = archiveUi.archives;
+const archiveDeleteSelections = archiveUi.deleteSelections;
 
 const renderTaskDetail = (panel, payload) => {
     panel.replaceChildren();
@@ -259,6 +267,44 @@ const renderTaskDetail = (panel, payload) => {
         ? `新增 ${payload.task.downloaded_count} · 已存在 ${payload.task.skipped_count} · 失败 ${payload.task.failed_count}`
         : `成功 ${payload.task.downloaded_count} · 跳过 ${payload.task.skipped_count} · 失败 ${payload.task.failed_count}`;
     panel.append(counts);
+    if (payload.task.status === 'completed') {
+        const taskId = payload.task.task_id;
+        const archiveControls = document.createElement('div');
+        archiveControls.className = 'd-flex flex-wrap align-items-center gap-2 mb-2';
+        const completedArchive = taskArchives.get(taskId) || payload.task.archive;
+        if (completedArchive) {
+            taskArchives.set(taskId, completedArchive);
+            const downloadButton = document.createElement('button');
+            downloadButton.type = 'button';
+            downloadButton.className = 'btn btn-sm btn-success';
+            downloadButton.dataset.archiveDownload = taskId;
+            downloadButton.textContent = '下载 ZIP';
+            archiveControls.append(downloadButton);
+        } else {
+            const archiveState = archiveProgress.get(taskId);
+            const archiveButton = document.createElement('button');
+            archiveButton.type = 'button';
+            archiveButton.className = 'btn btn-sm btn-outline-success';
+            archiveButton.dataset.taskArchive = taskId;
+            archiveButton.disabled = Boolean(archiveState);
+            archiveButton.textContent = archiveState
+                ? `打包 ${archiveState.current}/${archiveState.total || '…'}`
+                : '打包为 ZIP';
+            const deleteLabel = document.createElement('label');
+            deleteLabel.className = 'form-check small mb-0';
+            const deleteCheckbox = document.createElement('input');
+            deleteCheckbox.type = 'checkbox';
+            deleteCheckbox.className = 'form-check-input';
+            deleteCheckbox.dataset.deleteAfterArchive = taskId;
+            deleteCheckbox.checked = archiveDeleteSelections.get(taskId) || false;
+            const deleteText = document.createElement('span');
+            deleteText.className = 'form-check-label ms-2';
+            deleteText.textContent = '打包成功后删除原文件';
+            deleteLabel.append(deleteCheckbox, deleteText);
+            archiveControls.append(archiveButton, deleteLabel);
+        }
+        panel.append(archiveControls);
+    }
     const list = document.createElement('ul');
     list.className = 'mb-0';
     payload.failed_artworks.forEach((failure) => {
@@ -363,6 +409,40 @@ const renderTasks = (tasks) => {
         detailButton.dataset.taskDetail = task.task_id;
         detailButton.textContent = '详情';
         controls.append(detailButton);
+        let archiveDeleteOption = null;
+        if (task.status === 'completed') {
+            const archiveState = archiveProgress.get(task.task_id);
+            const completedArchive = taskArchives.get(task.task_id);
+            if (completedArchive) {
+                const downloadButton = document.createElement('button');
+                downloadButton.type = 'button';
+                downloadButton.className = 'btn btn-sm btn-success';
+                downloadButton.dataset.archiveDownload = task.task_id;
+                downloadButton.textContent = '下载 ZIP';
+                controls.append(downloadButton);
+            } else {
+                const archiveButton = document.createElement('button');
+                archiveButton.type = 'button';
+                archiveButton.className = 'btn btn-sm btn-outline-success';
+                archiveButton.dataset.taskArchive = task.task_id;
+                archiveButton.disabled = Boolean(archiveState);
+                archiveButton.textContent = archiveState
+                    ? `打包 ${archiveState.current}/${archiveState.total || '…'}`
+                    : '打包为 ZIP';
+                controls.append(archiveButton);
+                archiveDeleteOption = document.createElement('label');
+                archiveDeleteOption.className = 'form-check small mt-2';
+                const deleteCheckbox = document.createElement('input');
+                deleteCheckbox.type = 'checkbox';
+                deleteCheckbox.className = 'form-check-input';
+                deleteCheckbox.dataset.deleteAfterArchive = task.task_id;
+                deleteCheckbox.checked = archiveDeleteSelections.get(task.task_id) || false;
+                const deleteText = document.createElement('span');
+                deleteText.className = 'form-check-label ms-2';
+                deleteText.textContent = '打包成功后删除原文件';
+                archiveDeleteOption.append(deleteCheckbox, deleteText);
+            }
+        }
         if (task.failed_count && ['completed', 'failed'].includes(task.status)) {
             const retryButton = document.createElement('button');
             retryButton.type = 'button';
@@ -403,7 +483,9 @@ const renderTasks = (tasks) => {
         if (taskDetailCache.has(task.task_id)) {
             renderTaskDetail(detailPanel, taskDetailCache.get(task.task_id));
         }
-        card.append(header, progress, metrics, files, detailPanel);
+        card.append(header);
+        if (archiveDeleteOption) card.append(archiveDeleteOption);
+        card.append(progress, metrics, files, detailPanel);
         taskList.append(card);
     });
 };
@@ -414,6 +496,7 @@ const loadTasks = async () => {
         const response = await fetch('/api/tasks');
         const payload = await response.json();
         if (!response.ok) throw new Error(payload.error || '任务列表加载失败。');
+        archiveUi.rememberTasks(payload.tasks);
         renderTasks(payload.tasks);
         taskListFeedback.className = 'alert mt-3 d-none';
     } catch (error) {
@@ -435,6 +518,10 @@ const applyLiveTaskEvent = (payload) => {
 };
 
 socket.on('progress_update', applyLiveTaskEvent);
+socket.on('archive_progress', (payload) => {
+    archiveUi.setProgress(payload);
+    if (taskList) renderTasks(renderedTasks);
+});
 socket.on('task_complete', (payload) => {
     applyLiveTaskEvent({ ...payload, current_files: [], current_speed: 0, eta_seconds: 0 });
     loadTasks();
@@ -448,9 +535,66 @@ socket.on('error', (payload) => {
     loadTasks();
 });
 
+const downloadArchive = (archive) => archiveUi.download(archive, appToken);
+
 if (taskList) {
     document.getElementById('task-refresh').addEventListener('click', loadTasks);
+    taskList.addEventListener('change', (event) => {
+        const checkbox = event.target.closest('[data-delete-after-archive]');
+        if (!checkbox) return;
+            archiveUi.setDeleteSelection(
+                Number(checkbox.dataset.deleteAfterArchive), checkbox.checked,
+            );
+    });
     taskList.addEventListener('click', async (event) => {
+        const archiveButton = event.target.closest('[data-task-archive]');
+        if (archiveButton) {
+            const taskId = Number(archiveButton.dataset.taskArchive);
+            const card = archiveButton.closest('[data-task-card]');
+            const deleteOriginals = Boolean(
+                card?.querySelector(`[data-delete-after-archive="${taskId}"]`)?.checked
+            );
+            if (
+                deleteOriginals
+                && !window.confirm('ZIP 创建成功后将删除原文件，确定继续吗？')
+            ) return;
+            archiveProgress.set(taskId, { task_id: taskId, current: 0, total: null });
+            renderTasks(renderedTasks);
+            try {
+                const response = await fetch(`/api/tasks/${taskId}/archive`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-App-Token': appToken,
+                    },
+                    body: JSON.stringify({ delete_originals: deleteOriginals }),
+                });
+                const payload = await response.json().catch(() => ({}));
+                if (!response.ok) throw new Error(payload.error || '任务打包失败。');
+                taskArchives.set(taskId, payload.archive);
+                archiveDeleteSelections.delete(taskId);
+                taskListFeedback.className = 'alert alert-success mt-3';
+                taskListFeedback.textContent = `ZIP 已创建：${payload.archive.filename}`;
+            } catch (error) {
+                taskListFeedback.className = 'alert alert-danger mt-3';
+                taskListFeedback.textContent = error.message;
+            } finally {
+                archiveProgress.delete(taskId);
+                renderTasks(renderedTasks);
+            }
+            return;
+        }
+        const archiveDownloadButton = event.target.closest('[data-archive-download]');
+        if (archiveDownloadButton) {
+            const taskId = Number(archiveDownloadButton.dataset.archiveDownload);
+            try {
+                await downloadArchive(taskArchives.get(taskId));
+            } catch (error) {
+                taskListFeedback.className = 'alert alert-danger mt-3';
+                taskListFeedback.textContent = error.message;
+            }
+            return;
+        }
         const detailButton = event.target.closest('[data-task-detail]');
         if (detailButton) {
             const panel = taskList.querySelector(`[data-task-detail-panel="${detailButton.dataset.taskDetail}"]`);

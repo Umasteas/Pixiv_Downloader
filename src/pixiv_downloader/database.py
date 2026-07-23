@@ -1,5 +1,6 @@
 """SQLite 下载历史、任务记录和作品去重基础设施。"""
 import json
+import secrets
 import sqlite3
 import threading
 from collections import Counter
@@ -56,6 +57,20 @@ CREATE TABLE IF NOT EXISTS task_failures (
     UNIQUE(task_id, artwork_id),
     FOREIGN KEY (task_id) REFERENCES tasks(task_id)
 );
+
+CREATE TABLE IF NOT EXISTS task_archives (
+    task_id INTEGER PRIMARY KEY,
+    filename TEXT NOT NULL UNIQUE,
+    created_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    status TEXT NOT NULL DEFAULT 'reserved',
+    recovery_token TEXT,
+    file_count INTEGER NOT NULL,
+    file_size INTEGER NOT NULL,
+    deleted_originals INTEGER NOT NULL DEFAULT 0,
+    deleted_original_count INTEGER NOT NULL DEFAULT 0,
+    delete_failed_count INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (task_id) REFERENCES tasks(task_id)
+);
 """
 
 
@@ -80,6 +95,21 @@ class DatabaseManager:
         """首次启动时创建 PRD 定义的三张表。"""
         with self._lock, self.connection:
             self.connection.executescript(SCHEMA)
+            archive_columns = {
+                row[1]
+                for row in self.connection.execute("PRAGMA table_info(task_archives)")
+            }
+            if "status" not in archive_columns:
+                self.connection.execute(
+                    "ALTER TABLE task_archives ADD COLUMN status TEXT NOT NULL DEFAULT 'reserved'"
+                )
+                self.connection.execute(
+                    "UPDATE task_archives SET status = CASE WHEN file_count > 0 THEN 'complete' ELSE 'reserved' END"
+                )
+            if "recovery_token" not in archive_columns:
+                self.connection.execute(
+                    "ALTER TABLE task_archives ADD COLUMN recovery_token TEXT"
+                )
             columns = {
                 row[1]
                 for row in self.connection.execute("PRAGMA table_info(downloads)")
@@ -584,6 +614,173 @@ class DatabaseManager:
                 item["tags"] = [] if raw_tags == "[]" else None
             history.append(item)
         return history
+
+    def list_task_downloads(self, task_id: int) -> list[dict[str, Any]]:
+        """按作品 ID 返回仍归属指定任务的下载记录。"""
+        with self._lock:
+            rows = self.connection.execute(
+                "SELECT * FROM downloads WHERE task_id = ? ORDER BY artwork_id",
+                (task_id,),
+            ).fetchall()
+        downloads = []
+        for row in rows:
+            item = dict(row)
+            raw_tags = item.get("tags")
+            if raw_tags:
+                try:
+                    item["tags"] = json.loads(raw_tags)
+                except (TypeError, json.JSONDecodeError):
+                    item["tags"] = [raw_tags]
+            else:
+                item["tags"] = [] if raw_tags == "[]" else None
+            downloads.append(item)
+        return downloads
+
+    def reserve_task_archive(
+        self,
+        task_id: int,
+        base_filename: str,
+        unavailable_filenames: Iterable[str] = (),
+    ) -> str:
+        """结合数据库与磁盘占用名，为任务原子保留唯一文件名。"""
+        unavailable = {str(filename) for filename in unavailable_filenames}
+        recovery_token = secrets.token_hex(32)
+        with self._lock, self.connection:
+            existing = self.connection.execute(
+                "SELECT filename, status FROM task_archives WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if existing is not None and existing["status"] == "complete":
+                return str(existing["filename"])
+            candidate = base_filename
+            stem = Path(base_filename).stem
+            suffix = 0
+            while candidate in unavailable or self.connection.execute(
+                """
+                SELECT 1 FROM task_archives
+                WHERE filename = ? AND task_id != ?
+                """,
+                (candidate, task_id),
+            ).fetchone() is not None:
+                suffix += 1
+                candidate = f"{stem}_{task_id if suffix == 1 else f'{task_id}_{suffix}'}.zip"
+            if existing is not None:
+                self.connection.execute(
+                    """
+                    UPDATE task_archives
+                    SET filename = ?, status = 'reserved', file_count = 0,
+                        file_size = 0, deleted_originals = 0,
+                        deleted_original_count = 0, delete_failed_count = 0,
+                        recovery_token = ?
+                    WHERE task_id = ?
+                    """,
+                    (candidate, recovery_token, task_id),
+                )
+                return candidate
+            cursor = self.connection.execute(
+                """
+                INSERT INTO task_archives (
+                    task_id, filename, status, recovery_token, file_count, file_size
+                ) VALUES (?, ?, 'reserved', ?, 0, 0)
+                """,
+                (task_id, candidate, recovery_token),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("任务归档文件名保留失败")
+            return candidate
+
+    def get_task_archive(self, task_id: int) -> Optional[dict[str, Any]]:
+        """返回任务归档持久化记录。"""
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT * FROM task_archives WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def complete_task_archive(self, task_id: int, *, filename: str, file_count: int,
+                             file_size: int, deleted_originals: bool,
+                             deleted_original_count: int,
+                             delete_failed_count: int) -> Optional[dict[str, Any]]:
+        """提交归档完成状态；允许 reserved 或可恢复 failed 原子提交。"""
+        with self._lock, self.connection:
+            cursor = self.connection.execute(
+                """
+                UPDATE task_archives SET filename = ?, status = 'complete',
+                    file_count = ?, file_size = ?, deleted_originals = ?,
+                    deleted_original_count = ?, delete_failed_count = ?
+                WHERE task_id = ? AND status IN ('reserved', 'failed')
+                """,
+                (filename, file_count, file_size, int(deleted_originals),
+                 deleted_original_count, delete_failed_count, task_id),
+            )
+        return self.get_task_archive(task_id) if cursor.rowcount == 1 else None
+
+    def update_task_archive_deletion(
+        self,
+        task_id: int,
+        *,
+        deleted_originals: bool,
+        deleted_original_count: int,
+        delete_failed_count: int,
+    ) -> Optional[dict[str, Any]]:
+        """在归档已 complete 后持久化可选删除结果。"""
+        with self._lock, self.connection:
+            cursor = self.connection.execute(
+                """
+                UPDATE task_archives
+                SET deleted_originals = ?, deleted_original_count = ?,
+                    delete_failed_count = ?
+                WHERE task_id = ? AND status = 'complete'
+                """,
+                (
+                    int(deleted_originals),
+                    deleted_original_count,
+                    delete_failed_count,
+                    task_id,
+                ),
+            )
+        return self.get_task_archive(task_id) if cursor.rowcount == 1 else None
+
+    def fail_task_archive(self, task_id: int) -> Optional[dict[str, Any]]:
+        """标记提交失败，允许下次 reserve 安全重试。"""
+        with self._lock, self.connection:
+            cursor = self.connection.execute(
+                """
+                UPDATE task_archives SET status = 'failed'
+                WHERE task_id = ? AND status IN ('reserved', 'complete')
+                """,
+                (task_id,),
+            )
+        return self.get_task_archive(task_id) if cursor.rowcount == 1 else None
+
+    def list_task_archives(self, task_ids: Iterable[int]) -> dict[int, dict[str, Any]]:
+        """批量投影已完成归档，避免任务列表 N+1 查询。"""
+        ids = [int(task_id) for task_id in task_ids]
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        with self._lock:
+            rows = self.connection.execute(
+                f"SELECT * FROM task_archives WHERE status = 'complete' AND task_id IN ({placeholders})",
+                ids,
+            ).fetchall()
+        return {int(row["task_id"]): dict(row) for row in rows}
+
+    def get_task_archive_by_filename(
+        self,
+        filename: str,
+    ) -> Optional[dict[str, Any]]:
+        """按唯一文件名返回已完成归档记录。"""
+        with self._lock:
+            row = self.connection.execute(
+                """
+                SELECT * FROM task_archives
+                WHERE filename = ? AND status = 'complete'
+                """,
+                (filename,),
+            ).fetchone()
+        return dict(row) if row is not None else None
 
     def close(self) -> None:
         """关闭底层 SQLite 连接。"""

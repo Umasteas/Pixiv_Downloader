@@ -38,6 +38,18 @@ EXPECTED_COLUMNS = {
         "last_check_time",
         "last_artwork_id",
     ],
+    "task_archives": [
+        "task_id",
+        "filename",
+        "created_time",
+        "status",
+        "recovery_token",
+        "file_count",
+        "file_size",
+        "deleted_originals",
+        "deleted_original_count",
+        "delete_failed_count",
+    ],
 }
 
 
@@ -142,5 +154,38 @@ def test_database_enables_foreign_key_checks():
             pass
         else:
             raise AssertionError("不存在的 task_id 应触发外键约束")
+    finally:
+        manager.close()
+
+
+def test_old_task_archives_table_without_status_is_migrated(tmp_path):
+    database_path = tmp_path / "legacy.db"
+    connection = sqlite3.connect(database_path)
+    connection.executescript(
+        """
+        CREATE TABLE task_archives (
+            task_id INTEGER PRIMARY KEY,
+            filename TEXT NOT NULL UNIQUE,
+            created_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            file_count INTEGER NOT NULL,
+            file_size INTEGER NOT NULL,
+            deleted_originals INTEGER NOT NULL DEFAULT 0,
+            deleted_original_count INTEGER NOT NULL DEFAULT 0,
+            delete_failed_count INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT INTO task_archives (
+            task_id, filename, file_count, file_size
+        ) VALUES (7, 'legacy.zip', 2, 42);
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    manager = DatabaseManager(database_path)
+    try:
+        assert "status" in table_columns(manager.connection, "task_archives")
+        record = manager.get_task_archive(7)
+        assert record["status"] == "complete"
+        assert manager.get_task_archive_by_filename("legacy.zip")["task_id"] == 7
     finally:
         manager.close()

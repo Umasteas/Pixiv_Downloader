@@ -813,6 +813,9 @@ def test_task_api_redacts_private_bookmark_query_snapshot_and_failure_ids(monkey
         def get_task(self, task_id):
             return private_task
 
+        def list_task_archives(self, task_ids):
+            return {}
+
         def list_task_failures(self, task_id):
             return [{
                 "failure_id": 1,
