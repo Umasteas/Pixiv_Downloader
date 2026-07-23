@@ -74,17 +74,32 @@ def downloader(tmp_path, *, retry_times=3, retry_delays=(1, 3, 5), sleeps=None):
         Response(status=503),
     ],
 )
-async def test_retryable_failures_retry_then_replace_atomically(tmp_path, first_failure):
+async def test_retryable_failures_retry_then_replace_atomically(
+    tmp_path,
+    first_failure,
+    caplog,
+):
     sleeps = []
     target = tmp_path / "retry.jpg"
     session = SequenceSession([first_failure, Response(payload=b"success")])
 
-    await downloader(tmp_path, sleeps=sleeps).download_file("https://example.test/a", target, session=session)
+    with caplog.at_level("WARNING", logger="src.pixiv_downloader.downloader"):
+        await downloader(tmp_path, sleeps=sleeps).download_file(
+            "https://example.test/a",
+            target,
+            session=session,
+            task_id=7,
+            artwork_id=8,
+        )
 
     assert session.calls == 2
     assert sleeps == [1.0]
     assert target.read_bytes() == b"success"
     assert not target.with_suffix(".jpg.part").exists()
+    assert "下载请求失败，准备重试" in caplog.text
+    assert "task_id=7" in caplog.text
+    assert "artwork_id=8" in caplog.text
+    assert "https://example.test/a" not in caplog.text
 
 
 @pytest.mark.asyncio

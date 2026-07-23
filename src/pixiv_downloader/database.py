@@ -45,6 +45,17 @@ CREATE TABLE IF NOT EXISTS followed_artists (
     last_check_time TIMESTAMP,
     last_artwork_id INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS task_failures (
+    failure_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL,
+    artwork_id INTEGER NOT NULL,
+    category TEXT NOT NULL,
+    message TEXT NOT NULL,
+    created_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(task_id, artwork_id),
+    FOREIGN KEY (task_id) REFERENCES tasks(task_id)
+);
 """
 
 
@@ -183,6 +194,39 @@ class DatabaseManager:
             )
         return int(cursor.lastrowid)
 
+    def create_retry_task(
+        self,
+        *,
+        source_task_id: int,
+        artwork_ids: list[int],
+    ) -> tuple[int, bool]:
+        """原子创建失败项重试；同一来源最多存在一个活跃重试任务。"""
+        query = {"source_task_id": source_task_id, "artwork_ids": artwork_ids}
+        encoded_query = json.dumps(query, ensure_ascii=False)
+        with self._lock, self.connection:
+            rows = self.connection.execute(
+                """
+                SELECT task_id, query FROM tasks
+                WHERE task_type = 'retry_failed'
+                  AND status IN ('pending', 'running', 'paused')
+                """
+            ).fetchall()
+            for row in rows:
+                try:
+                    existing_query = json.loads(row["query"])
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if existing_query.get("source_task_id") == source_task_id:
+                    return int(row["task_id"]), False
+            cursor = self.connection.execute(
+                """
+                INSERT INTO tasks (task_type, query, status)
+                VALUES ('retry_failed', ?, 'pending')
+                """,
+                (encoded_query,),
+            )
+        return int(cursor.lastrowid), True
+
     def get_task(self, task_id: int) -> Optional[dict[str, Any]]:
         """回读单个任务，并恢复结构化 query/filters。"""
         with self._lock:
@@ -253,10 +297,62 @@ class DatabaseManager:
         with self._lock, self.connection:
             cursor = self.connection.execute(
                 f"UPDATE tasks SET {column} = {column} + 1 "
-                "WHERE task_id = ? AND status NOT IN ('completed', 'failed')",
+                "WHERE task_id = ? AND status = 'running'",
                 (task_id,),
             )
         return self.get_task(task_id) if cursor.rowcount == 1 else None
+
+    def record_task_failure(
+        self,
+        task_id: int,
+        *,
+        artwork_id: int,
+        category: str,
+        message: str,
+    ) -> Optional[dict[str, Any]]:
+        """幂等记录失败作品，并仅在首次写入时累加 failed_count。"""
+        if type(artwork_id) is not int or artwork_id <= 0:
+            raise ValueError("artwork_id 必须是正整数")
+        if category not in {"recoverable", "skipped"}:
+            raise ValueError("失败作品类别必须是 recoverable 或 skipped")
+        with self._lock, self.connection:
+            task = self.connection.execute(
+                "SELECT status FROM tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if task is None or task["status"] != "running":
+                return None
+            cursor = self.connection.execute(
+                """
+                INSERT OR IGNORE INTO task_failures (
+                    task_id, artwork_id, category, message
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (task_id, artwork_id, category, str(message)[:300]),
+            )
+            if cursor.rowcount == 1:
+                self.connection.execute(
+                    "UPDATE tasks SET failed_count = failed_count + 1 "
+                    "WHERE task_id = ? AND status = 'running'",
+                    (task_id,),
+                )
+        return self.get_task(task_id)
+
+    def list_task_failures(self, task_id: int) -> list[dict[str, Any]]:
+        """按写入顺序返回任务的失败作品明细。"""
+        with self._lock:
+            rows = self.connection.execute(
+                "SELECT * FROM task_failures WHERE task_id = ? ORDER BY failure_id",
+                (task_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def failed_artwork_ids(self, task_id: int) -> list[int]:
+        """返回可用于仅失败项重试的稳定作品 ID 列表。"""
+        return [
+            int(item["artwork_id"])
+            for item in self.list_task_failures(task_id)
+        ]
 
     def set_task_total(self, task_id: int, total_count: int) -> Optional[dict[str, Any]]:
         """持久化运行任务的总作品数。"""

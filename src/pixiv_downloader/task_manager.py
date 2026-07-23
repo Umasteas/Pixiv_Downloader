@@ -57,6 +57,26 @@ class TaskControl:
             self._manager._publish_progress(task, eta_seconds=eta)
         return task
 
+    def record_failure(
+        self,
+        artwork_id: int,
+        category: str,
+        message: str,
+    ) -> dict[str, Any]:
+        """持久化一个可重试的失败作品及安全错误摘要。"""
+        task = self._manager.database.record_task_failure(
+            self.task_id,
+            artwork_id=artwork_id,
+            category=category,
+            message=message,
+        )
+        if task is None:
+            raise TaskManagerError("任务不能再记录失败作品")
+        now = self._manager.clock()
+        if self._progress_due(now):
+            self._manager._publish_progress(task)
+        return task
+
     def set_total(self, total_count: int) -> dict[str, Any]:
         """持久化任务总作品数。"""
         task = self._manager.database.set_task_total(self.task_id, total_count)
@@ -129,6 +149,17 @@ class TaskManager:
     def create_task(self, **task: Any) -> int:
         return self.database.create_task(**task)
 
+    def create_retry_task(
+        self,
+        *,
+        source_task_id: int,
+        artwork_ids: list[int],
+    ) -> tuple[int, bool]:
+        return self.database.create_retry_task(
+            source_task_id=source_task_id,
+            artwork_ids=artwork_ids,
+        )
+
     def list_tasks(self) -> list[dict[str, Any]]:
         return self.database.list_tasks()
 
@@ -193,9 +224,11 @@ class TaskManager:
 
     def _execute_task(self, task: dict[str, Any]) -> dict[str, Any]:
         task_id = task["task_id"]
+        logger.info("任务开始：task_id=%s type=%s", task_id, task["task_type"])
         try:
             self.execute(task, TaskControl(self, task_id))
         except Exception:
+            logger.error("任务执行失败：task_id=%s", task_id)
             current = self.database.get_task(task_id)
             if current is not None and current["status"] in {"running", "paused"}:
                 failed = self.database.transition_task(task_id, current["status"], "failed")
@@ -217,6 +250,7 @@ class TaskManager:
                 completed = self.database.transition_task(task_id, "running", "completed")
                 if completed is None:
                     raise TaskManagerError("任务执行期间状态已变化")
+                logger.info("任务完成：task_id=%s", task_id)
                 self._publish_terminal("task_complete", completed)
                 return completed
         finally:

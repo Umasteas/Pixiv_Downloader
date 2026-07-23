@@ -1,6 +1,7 @@
 """画师来源的 Pixiv 单图作品下载服务。"""
 import asyncio
 import json
+import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +11,13 @@ from urllib.parse import parse_qs, urlparse
 import aiohttp
 
 from .download_policy import DownloadPolicy
+from .errors import (
+    ErrorCategory,
+    FatalDownloadError,
+    RecoverableDownloadError,
+    SkippableDownloadError,
+    classify_error,
+)
 from .filters import filter_artworks
 from .rate_limiter import AdaptiveLimiter
 
@@ -19,6 +27,9 @@ from .file_organizer import (
     get_save_path,
     metadata_path_for,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 def _field(value: Any, name: str, default=None):
@@ -120,6 +131,8 @@ class ArtistDownloader:
         progress: Callable[[str, int, int | None, bool], None] | None = None,
         limiter=None,
         control=None,
+        task_id: int | None = None,
+        artwork_id: int | None = None,
     ) -> None:
         """通过统一代理配置流式下载文件，并原子替换目标。"""
         save_path = Path(save_path)
@@ -147,6 +160,15 @@ class ArtistDownloader:
                         raise _RetryableHttpStatus(status, retry_after)
                     if 500 <= status <= 599:
                         raise _RetryableHttpStatus(status)
+                    if status in {401, 403}:
+                        raise FatalDownloadError("Pixiv 登录状态失效。")
+                    if 400 <= status <= 499:
+                        message = (
+                            "作品或文件不存在。"
+                            if status == 404
+                            else "Pixiv 拒绝了作品请求。"
+                        )
+                        raise SkippableDownloadError(message)
                     response.raise_for_status()
                     total_bytes = getattr(response, "content_length", None)
                     downloaded_bytes = 0
@@ -176,13 +198,28 @@ class ArtistDownloader:
                 except (aiohttp.ClientError, asyncio.TimeoutError, _RetryableHttpStatus) as exc:
                     temporary.unlink(missing_ok=True)
                     if attempt >= self.policy.retry_times:
-                        raise DownloadError(f"下载重试耗尽：{url}") from exc
+                        raise RecoverableDownloadError("下载重试耗尽") from exc
                     delay = self.policy.retry_delays[attempt]
                     if isinstance(exc, _RetryableHttpStatus) and exc.status == 429:
                         if limiter is not None:
                             await limiter.reduce_limit()
                         if exc.retry_after is not None:
                             delay = max(delay, exc.retry_after)
+                    reason = (
+                        f"HTTP {exc.status}"
+                        if isinstance(exc, _RetryableHttpStatus)
+                        else exc.__class__.__name__
+                    )
+                    logger.warning(
+                        "下载请求失败，准备重试：task_id=%s artwork_id=%s "
+                        "attempt=%s/%s delay=%s reason=%s",
+                        task_id,
+                        artwork_id,
+                        attempt + 1,
+                        self.policy.retry_times,
+                        delay,
+                        reason,
+                    )
                     await self.sleep(delay)
                 except Exception:
                     temporary.unlink(missing_ok=True)
@@ -227,6 +264,8 @@ class ArtistDownloader:
                     progress=progress,
                     limiter=limiter,
                     control=control,
+                    task_id=task_id,
+                    artwork_id=artwork_id,
                 )
                 for url, page_path in zip(urls, page_paths)
                 if not page_path.exists()
@@ -255,6 +294,8 @@ class ArtistDownloader:
                 progress=progress,
                 limiter=limiter,
                 control=control,
+                task_id=task_id,
+                artwork_id=artwork_id,
             )
             metadata_path = metadata_path_for(save_path)
             file_size = save_path.stat().st_size
@@ -343,7 +384,7 @@ class ArtistDownloader:
         async with self.session_factory(**session_options) as session:
             scheduled = list(items[start_index:])
 
-            async def process(item: Any) -> str | None:
+            async def process(item: Any):
                 if not await _control_allows_progress(control):
                     return None
                 try:
@@ -362,22 +403,78 @@ class ArtistDownloader:
                     )
                 except DownloadCancelled:
                     return None
-                except Exception:
-                    status = "failed"
-                return status
+                except Exception as exc:
+                    failure = classify_error(exc)
+                    if failure.category is ErrorCategory.FATAL:
+                        raise FatalDownloadError(failure.message) from exc
+                    try:
+                        artwork_id = int(_field(item, "id", item))
+                    except (TypeError, ValueError) as id_error:
+                        raise FatalDownloadError("失败作品缺少有效 ID。") from id_error
+                    logger.warning(
+                        "作品处理失败并跳过：artwork_id=%s category=%s message=%s",
+                        artwork_id,
+                        failure.category.value,
+                        failure.message,
+                    )
+                    return "failed", (
+                        artwork_id,
+                        failure.category.value,
+                        failure.message,
+                    )
+                return status, None
 
-            statuses = await asyncio.gather(*(process(item) for item in scheduled))
+            statuses = [None] * len(scheduled)
+            next_index = 0
+            claim_lock = asyncio.Lock()
+            stop_scheduling = asyncio.Event()
+
+            async def worker() -> None:
+                nonlocal next_index
+                while True:
+                    async with claim_lock:
+                        if stop_scheduling.is_set() or next_index >= len(scheduled):
+                            return
+                        index = next_index
+                        next_index += 1
+                    try:
+                        item_result = await process(scheduled[index])
+                    except FatalDownloadError:
+                        stop_scheduling.set()
+                        raise
+                    statuses[index] = item_result
+                    if item_result is None:
+                        stop_scheduling.set()
+                        return
+
+            workers = [
+                asyncio.create_task(worker())
+                for _ in range(min(self.policy.max_concurrent, len(scheduled)))
+            ]
+            try:
+                await asyncio.gather(*workers)
+            except BaseException:
+                stop_scheduling.set()
+                for task in workers:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*workers, return_exceptions=True)
+                raise
             checkpoint_prefix_open = True
-            for status in statuses:
-                if status is None:
+            for item_result in statuses:
+                if item_result is None:
                     checkpoint_prefix_open = False
                     continue
+                status, failure = item_result
                 result[status] += 1
                 if control is not None and checkpoint_prefix_open:
                     if not await _control_allows_progress(control):
                         checkpoint_prefix_open = False
                         continue
-                    control.record_result(status)
+                    if failure is not None and hasattr(control, "record_failure"):
+                        control.record_failure(*failure)
+                    else:
+                        control.record_result(status)
         return result
 
     @staticmethod

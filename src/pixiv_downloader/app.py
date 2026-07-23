@@ -14,6 +14,7 @@ from .database import DatabaseManager
 from .downloader import ArtistDownloader
 from .follow_latest import FollowLatestError, FollowLatestScanner
 from .filters import FilterValidationError, normalize_filters
+from .logging_setup import configure_logging
 from .proxy import ProxyConfigError, ProxyManager
 from .runtime import runtime_paths
 from .task_manager import TaskManager, TaskManagerError
@@ -27,7 +28,19 @@ app = Flask(
 app.config['SECRET_KEY'] = secrets.token_hex(16)
 
 socketio = SocketIO(app, cors_allowed_origins="*")
+
+
+def _publish_log_entry(payload):
+    """广播已脱敏的 INFO 及以上日志。"""
+    socketio.emit("log_entry", payload)
+
+
 config_manager = ConfigManager(str(RUNTIME_PATHS.config_file))
+configure_logging(
+    RUNTIME_PATHS.logs_dir,
+    config_manager.config.get("logging", {}),
+    publish=_publish_log_entry,
+)
 auth_manager = AuthManager(config_manager)
 proxy_manager = ProxyManager(config_manager)
 database_manager = DatabaseManager(RUNTIME_PATHS.database_file)
@@ -45,14 +58,14 @@ def _execute_download_task(task, control):
         if type(value) is not int or value <= 0:
             raise TaskManagerError("画师任务缺少有效 ID")
         filters = normalize_filters(task.get("filters"))
-    elif task_type == "follow_latest":
+    elif task_type in {"follow_latest", "retry_failed"}:
         value = query.get("artwork_ids")
         if (
             not isinstance(value, list)
             or not value
             or any(type(item) is not int or item <= 0 for item in value)
         ):
-            raise TaskManagerError("关注任务缺少有效作品 ID")
+            raise TaskManagerError("作品 ID 任务缺少有效作品 ID")
     else:
         raise TaskManagerError("暂不支持该任务类型")
     auth_manager.get_access_token()
@@ -175,6 +188,12 @@ def update_config():
         if isinstance(values, dict):
             for key, value in values.items():
                 config_manager.update_setting(section, key, value)
+    if "logging" in data:
+        configure_logging(
+            RUNTIME_PATHS.logs_dir,
+            config_manager.config.get("logging", {}),
+            publish=_publish_log_entry,
+        )
     
     return jsonify({"success": True})
 
@@ -323,6 +342,51 @@ def get_download_stats():
 def get_tasks():
     """获取任务列表"""
     return jsonify({"tasks": task_manager.list_tasks()})
+
+
+@app.route('/api/tasks/<int:task_id>', methods=['GET'])
+def get_task_detail(task_id):
+    """返回任务计数与失败作品明细。"""
+    task = database_manager.get_task(task_id)
+    if task is None:
+        return jsonify({"success": False, "error": "任务不存在。"}), 404
+    return jsonify({
+        "success": True,
+        "task": task,
+        "failed_artworks": database_manager.list_task_failures(task_id),
+    })
+
+
+@app.route('/api/tasks/<int:task_id>/retry-failed', methods=['POST'])
+def retry_failed_task(task_id):
+    """创建仅包含指定任务失败作品的新任务。"""
+    task = database_manager.get_task(task_id)
+    if task is None:
+        return jsonify({"success": False, "error": "任务不存在。"}), 404
+    if task["status"] not in {"completed", "failed"}:
+        return jsonify({
+            "success": False,
+            "error": "只能重试已结束任务的失败作品。",
+        }), 409
+    artwork_ids = database_manager.failed_artwork_ids(task_id)
+    if not artwork_ids:
+        return jsonify({"success": False, "error": "该任务没有失败作品。"}), 409
+    retry_task_id, created = task_manager.create_retry_task(
+        source_task_id=task_id,
+        artwork_ids=artwork_ids,
+    )
+    if not created:
+        return jsonify({
+            "success": False,
+            "error": "该任务已有失败项重试任务正在处理。",
+            "existing_task_id": retry_task_id,
+        }), 409
+    return jsonify({
+        "success": True,
+        "task_id": retry_task_id,
+        "selected_count": len(artwork_ids),
+        "status": "pending",
+    }), 201
 
 @app.route('/api/tasks', methods=['POST'])
 def create_task():

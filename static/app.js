@@ -166,10 +166,48 @@ const taskStatusLabels = {
     pending: '等待中', running: '运行中', paused: '已暂停', completed: '已完成',
     cancelled: '已取消', failed: '失败',
 };
+const taskLogConsole = document.getElementById('task-log-console');
+const taskLogClear = document.getElementById('task-log-clear');
+
+socket.on('log_entry', (entry) => {
+    if (!taskLogConsole) return;
+    const row = document.createElement('li');
+    row.className = `border-top py-1 text-${entry.level === 'ERROR' ? 'danger' : entry.level === 'WARNING' ? 'warning' : 'body'}`;
+    row.textContent = `${entry.timestamp || ''} [${entry.level || 'INFO'}] ${entry.message || ''}`;
+    taskLogConsole.append(row);
+    while (taskLogConsole.children.length > 200) taskLogConsole.firstElementChild.remove();
+    taskLogConsole.scrollTop = taskLogConsole.scrollHeight;
+});
+if (taskLogClear) taskLogClear.addEventListener('click', () => taskLogConsole.replaceChildren());
 const taskActions = {
     pending: [['start', '开始'], ['cancel', '取消']],
     running: [['pause', '暂停'], ['cancel', '取消']],
     paused: [['resume', '恢复'], ['cancel', '取消']],
+};
+const taskDetailCache = new Map();
+
+const renderTaskDetail = (panel, payload) => {
+    panel.replaceChildren();
+    const counts = document.createElement('p');
+    counts.className = 'mb-2';
+    counts.textContent = `成功 ${payload.task.downloaded_count} · 跳过 ${payload.task.skipped_count} · 失败 ${payload.task.failed_count}`;
+    panel.append(counts);
+    const list = document.createElement('ul');
+    list.className = 'mb-0';
+    payload.failed_artworks.forEach((failure) => {
+        const item = document.createElement('li');
+        item.textContent = `作品 ${failure.artwork_id} · ${failure.message}`;
+        list.append(item);
+    });
+    if (payload.failed_artworks.length) {
+        panel.append(list);
+    } else {
+        const empty = document.createElement('p');
+        empty.className = 'text-muted mb-0';
+        empty.textContent = '没有失败作品。';
+        panel.append(empty);
+    }
+    panel.classList.remove('d-none');
 };
 const formatEta = (seconds) => {
     if (seconds === null || seconds === undefined) return '待计算';
@@ -210,7 +248,12 @@ const renderTasks = (tasks) => {
         const summary = document.createElement('div');
         const artistId = task.query?.artist_id;
         const filterSummary = formatFilterSummary(task.filters);
-        summary.textContent = `#${task.task_id} · ${artistId ? `画师 ${artistId}` : task.task_type} · ${taskStatusLabels[task.status] || task.status}${filterSummary ? ` · ${filterSummary}` : ''}`;
+        let taskLabel = task.task_type;
+        if (artistId) taskLabel = `画师 ${artistId}`;
+        if (task.task_type === 'retry_failed') {
+            taskLabel = `失败项重试（来源任务 #${task.query?.source_task_id}）`;
+        }
+        summary.textContent = `#${task.task_id} · ${taskLabel} · ${taskStatusLabels[task.status] || task.status}${filterSummary ? ` · ${filterSummary}` : ''}`;
         const controls = document.createElement('div');
         controls.className = 'd-flex gap-2';
         (taskActions[task.status] || []).forEach(([action, label]) => {
@@ -222,6 +265,20 @@ const renderTasks = (tasks) => {
             button.textContent = label;
             controls.append(button);
         });
+        const detailButton = document.createElement('button');
+        detailButton.type = 'button';
+        detailButton.className = 'btn btn-sm btn-outline-secondary';
+        detailButton.dataset.taskDetail = task.task_id;
+        detailButton.textContent = '详情';
+        controls.append(detailButton);
+        if (task.failed_count && ['completed', 'failed'].includes(task.status)) {
+            const retryButton = document.createElement('button');
+            retryButton.type = 'button';
+            retryButton.className = 'btn btn-sm btn-outline-warning';
+            retryButton.dataset.retryFailed = task.task_id;
+            retryButton.textContent = '重试失败项';
+            controls.append(retryButton);
+        }
         header.append(summary, controls);
         const progress = document.createElement('div');
         progress.className = 'progress mt-3';
@@ -245,7 +302,13 @@ const renderTasks = (tasks) => {
             item.textContent = `${file.filename} · ${file.progress}%`;
             files.append(item);
         });
-        card.append(header, progress, metrics, files);
+        const detailPanel = document.createElement('div');
+        detailPanel.className = 'mt-3 d-none';
+        detailPanel.dataset.taskDetailPanel = task.task_id;
+        if (taskDetailCache.has(task.task_id)) {
+            renderTaskDetail(detailPanel, taskDetailCache.get(task.task_id));
+        }
+        card.append(header, progress, metrics, files, detailPanel);
         taskList.append(card);
     });
 };
@@ -293,6 +356,42 @@ socket.on('error', (payload) => {
 if (taskList) {
     document.getElementById('task-refresh').addEventListener('click', loadTasks);
     taskList.addEventListener('click', async (event) => {
+        const detailButton = event.target.closest('[data-task-detail]');
+        if (detailButton) {
+            const panel = taskList.querySelector(`[data-task-detail-panel="${detailButton.dataset.taskDetail}"]`);
+            detailButton.disabled = true;
+            try {
+                const response = await fetch(`/api/tasks/${detailButton.dataset.taskDetail}`);
+                const payload = await response.json();
+                if (!response.ok) throw new Error(payload.error || '任务详情加载失败。');
+                taskDetailCache.set(Number(detailButton.dataset.taskDetail), payload);
+                renderTaskDetail(panel, payload);
+            } catch (error) {
+                taskListFeedback.className = 'alert alert-danger mt-3';
+                taskListFeedback.textContent = error.message;
+            } finally {
+                detailButton.disabled = false;
+            }
+            return;
+        }
+        const retryButton = event.target.closest('[data-retry-failed]');
+        if (retryButton) {
+            retryButton.disabled = true;
+            try {
+                const response = await fetch(`/api/tasks/${retryButton.dataset.retryFailed}/retry-failed`, { method: 'POST' });
+                const payload = await response.json();
+                if (!response.ok) throw new Error(payload.error || '失败作品重试任务创建失败。');
+                taskListFeedback.className = 'alert alert-success mt-3';
+                taskListFeedback.textContent = `已创建失败项重试任务 #${payload.task_id}。`;
+                await loadTasks();
+            } catch (error) {
+                taskListFeedback.className = 'alert alert-danger mt-3';
+                taskListFeedback.textContent = error.message;
+            } finally {
+                retryButton.disabled = false;
+            }
+            return;
+        }
         const button = event.target.closest('[data-task-action]');
         if (!button) return;
         button.disabled = true;

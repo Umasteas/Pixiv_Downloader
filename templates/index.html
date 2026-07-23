@@ -112,6 +112,20 @@
                 </div>
             </div>
             <div class="col-12 mt-4">
+                <div id="task-log-panel" class="card">
+                    <div class="card-body">
+                        <div class="d-flex justify-content-between align-items-center gap-3">
+                            <div>
+                                <h2 class="h4 mb-1">实时日志</h2>
+                                <p class="text-muted mb-0">显示当前会话 INFO 及以上级别的任务日志。</p>
+                            </div>
+                            <button id="task-log-clear" class="btn btn-outline-secondary btn-sm" type="button">清空</button>
+                        </div>
+                        <ol id="task-log-console" class="list-unstyled small font-monospace mt-3 mb-0 overflow-auto" style="max-height: 16rem" aria-live="polite"></ol>
+                    </div>
+                </div>
+            </div>
+            <div class="col-12 mt-4">
                 <div id="follow-latest-panel" class="card">
                     <div class="card-body">
                         <div class="d-flex flex-wrap justify-content-between gap-3 align-items-center">
