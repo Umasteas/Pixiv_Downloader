@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from .ranking import ranking_mode
+
 
 _INVALID_FILENAME = re.compile(r'[\x00-\x1f\\/:*?"<>|]')
 _ALLOWED_IMAGE_EXTENSIONS = {".gif", ".jpeg", ".jpg", ".png"}
@@ -74,6 +76,24 @@ def create_search_directory(
     search_dir = Path(output_dir) / "search" / f"{keyword_component}{suffix}"
     search_dir.mkdir(parents=True, exist_ok=True)
     return search_dir
+
+
+def create_ranking_directory(
+    output_dir: Path | str,
+    ranking_type: str,
+    ranking_date: date,
+) -> Path:
+    """为受支持榜单创建固定日期集合目录。"""
+    ranking_mode(ranking_type)
+    if type(ranking_date) is not date:
+        raise ValueError("榜单日期无效")
+    ranking_dir = (
+        Path(output_dir)
+        / "ranking"
+        / f"{ranking_type}_{ranking_date.isoformat()}"
+    )
+    ranking_dir.mkdir(parents=True, exist_ok=True)
+    return ranking_dir
 
 
 def get_collection_artwork_directory(

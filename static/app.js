@@ -282,6 +282,12 @@ const filterLabels = {
     illust: '插画', manga: '漫画', ugoira: '动图',
     general: '全年龄', r18: 'R-18', r18g: 'R-18-G',
 };
+const rankingLabels = {
+    daily: '综合日榜', daily_illust: '插画日榜', daily_ugoira: '动图日榜',
+    weekly: '综合周榜', monthly: '综合月榜', rookie: '新人榜',
+    daily_manga: '漫画日榜', daily_r18: 'R-18 日榜',
+    weekly_r18: 'R-18 周榜', weekly_r18g: 'R-18-G 周榜',
+};
 const formatFilterSummary = (filters) => {
     if (!filters) return '';
     const types = (filters.work_types || []).map((value) => filterLabels[value] || value).join('/');
@@ -315,6 +321,9 @@ const renderTasks = (tasks) => {
         let taskLabel = task.task_type;
         if (artistId) taskLabel = `画师 ${artistId}`;
         if (task.task_type === 'search') taskLabel = `搜索 ${task.query?.keyword}`;
+        if (task.task_type === 'ranking') {
+            taskLabel = `排行榜 ${rankingLabels[task.query?.ranking_type] || task.query?.ranking_type} · ${task.query?.date}`;
+        }
         if (task.task_type === 'retry_failed') {
             taskLabel = `失败项重试（来源任务 #${task.query?.source_task_id}）`;
         }
@@ -588,6 +597,92 @@ if (searchDownloadForm) {
             if (!response.ok) throw new Error(payload.error || '搜索任务创建失败。');
             feedback.className = 'alert alert-success mt-3';
             feedback.textContent = `已创建搜索任务 #${payload.task_id}，请在任务列表中开始。`;
+            await loadTasks();
+        } catch (error) {
+            feedback.className = 'alert alert-danger mt-3';
+            feedback.textContent = error.message;
+        } finally {
+            submitButton.disabled = false;
+        }
+    });
+}
+
+const rankingDownloadForm = document.getElementById('ranking-download-form');
+const JST_OFFSET_MS = 9 * 60 * 60 * 1000;
+const RANKING_WINDOW_DAYS = 30;
+
+if (rankingDownloadForm) {
+    const typeInput = document.getElementById('ranking-type');
+    const dateInput = document.getElementById('ranking-date');
+    const limitInput = document.getElementById('ranking-limit');
+    const minBookmarksInput = document.getElementById('ranking-min-bookmarks');
+    const submitButton = document.getElementById('ranking-download-submit');
+    const feedback = document.getElementById('ranking-download-feedback');
+    const checkedValues = (name) => Array.from(
+        rankingDownloadForm.querySelectorAll(`input[name="${name}"]:checked`),
+        (input) => input.value,
+    );
+    const jstNow = new Date(Date.now() + JST_OFFSET_MS);
+    const maximumDate = jstNow.toISOString().slice(0, 10);
+    const minimumDate = new Date(
+        jstNow.getTime() - (RANKING_WINDOW_DAYS - 1) * 24 * 60 * 60 * 1000,
+    ).toISOString().slice(0, 10);
+    dateInput.min = minimumDate;
+    dateInput.max = maximumDate;
+    dateInput.value = maximumDate;
+
+    rankingDownloadForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const limit = Number(limitInput.value);
+        const minimumBookmarks = Number(minBookmarksInput.value);
+        const workTypes = checkedValues('ranking-work-types');
+        const r18Modes = checkedValues('ranking-r18-modes');
+        if (
+            dateInput.value < minimumDate
+            || dateInput.value > maximumDate
+            || !Number.isInteger(limit)
+            || limit < 1
+            || limit > 500
+        ) {
+            feedback.className = 'alert alert-danger mt-3';
+            feedback.textContent = '请选择最近 30 天内的日期，并将数量设为 1 至 500 的整数。';
+            return;
+        }
+        if (
+            !workTypes.length
+            || !r18Modes.length
+            || !Number.isInteger(minimumBookmarks)
+            || minimumBookmarks < 0
+        ) {
+            feedback.className = 'alert alert-danger mt-3';
+            feedback.textContent = '请选择作品类型和分级，并输入有效的最低收藏数。';
+            return;
+        }
+        submitButton.disabled = true;
+        feedback.className = 'alert alert-info mt-3';
+        feedback.textContent = '正在创建排行榜任务…';
+        try {
+            const response = await fetch('/api/tasks', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    task_type: 'ranking',
+                    query: {
+                        ranking_type: typeInput.value,
+                        date: dateInput.value,
+                        limit,
+                    },
+                    filters: {
+                        work_types: workTypes,
+                        r18_modes: r18Modes,
+                        min_bookmarks: minimumBookmarks,
+                    },
+                }),
+            });
+            const payload = await response.json();
+            if (!response.ok) throw new Error(payload.error || '排行榜任务创建失败。');
+            feedback.className = 'alert alert-success mt-3';
+            feedback.textContent = `已创建排行榜任务 #${payload.task_id}，请在任务列表中开始。`;
             await loadTasks();
         } catch (error) {
             feedback.className = 'alert alert-danger mt-3';

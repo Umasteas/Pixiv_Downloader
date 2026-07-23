@@ -19,6 +19,7 @@ from .errors import (
     classify_error,
 )
 from .filters import filter_artworks
+from .ranking import normalize_ranking_query, ranking_mode, ranking_work_type
 from .rate_limiter import AdaptiveLimiter
 from .search import normalize_search_query
 from .ugoira import (
@@ -103,6 +104,7 @@ class ArtistDownloader:
         ugoira_options: dict[str, Any] | None = None,
         collection_dir: Path | str | None = None,
         source: str = "artist",
+        metadata_context: dict[str, Any] | None = None,
         gif_converter=convert_to_gif,
         mp4_converter=convert_to_mp4,
         ffmpeg_checker=check_ffmpeg,
@@ -113,6 +115,7 @@ class ArtistDownloader:
         self.output_dir = Path(output_dir)
         self.collection_dir = Path(collection_dir) if collection_dir is not None else None
         self.source = source
+        self.metadata_context = dict(metadata_context or {})
         self.session_factory = session_factory
         self.policy = policy or DownloadPolicy()
         self.sleep = sleep
@@ -213,6 +216,77 @@ class ArtistDownloader:
                 ),
                 reverse=True,
             )
+        return artworks[:query["limit"]]
+
+    def fetch_ranking(
+        self,
+        ranking_type: str,
+        ranking_date: str,
+        limit: int,
+        *,
+        control=None,
+    ) -> list[Any]:
+        """按固定榜单、日期和有界候选数量读取排行榜。"""
+        query = normalize_ranking_query({
+            "ranking_type": ranking_type,
+            "date": ranking_date,
+            "limit": limit,
+        })
+        artworks: list[Any] = []
+        seen_artwork_ids: set[int] = set()
+        offset: int | None = None
+        last_offset = -1
+        request_count = 0
+
+        while request_count < 100:
+            if control is not None and not control.checkpoint():
+                break
+            options: dict[str, Any] = {
+                "mode": ranking_mode(query["ranking_type"]),
+                "filter": "for_ios",
+                "date": query["date"],
+            }
+            if offset is not None:
+                options["offset"] = offset
+            response = self.api.illust_ranking(**options)
+            request_count += 1
+            count_before_page = len(artworks)
+            for artwork in _field(response, "illusts", []) or []:
+                if len(artworks) >= query["limit"]:
+                    break
+                raw_artwork_id = _field(artwork, "id")
+                if isinstance(raw_artwork_id, bool):
+                    continue
+                try:
+                    artwork_id = int(raw_artwork_id)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if artwork_id <= 0:
+                    continue
+                if artwork_id in seen_artwork_ids:
+                    continue
+                seen_artwork_ids.add(artwork_id)
+                artworks.append(artwork)
+
+            if len(artworks) >= query["limit"]:
+                break
+            if len(artworks) == count_before_page:
+                break
+
+            next_url = _field(response, "next_url")
+            if not next_url:
+                break
+            values = parse_qs(urlparse(str(next_url)).query).get("offset", [])
+            if len(values) != 1 or not values[0].isdigit():
+                break
+            if len(values[0]) > len(str(1_000_000)):
+                break
+            next_offset = int(values[0])
+            if next_offset <= last_offset or next_offset > 1_000_000:
+                break
+            offset = next_offset
+            last_offset = next_offset
+
         return artworks[:query["limit"]]
 
     async def download_file(
@@ -582,6 +656,41 @@ class ArtistDownloader:
             control=control,
         )
 
+    async def download_ranking(
+        self,
+        ranking_type: str,
+        ranking_date: str,
+        limit: int,
+        *,
+        task_id: int | None = None,
+        start_index: int = 0,
+        control=None,
+        filters: dict[str, Any] | None = None,
+    ) -> dict[str, int]:
+        """下载规范化榜单结果，并复用筛选、并发和恢复语义。"""
+        fetch_options = {"control": control} if control is not None else {}
+        artworks = self.fetch_ranking(
+            ranking_type,
+            ranking_date,
+            limit,
+            **fetch_options,
+        )
+        required_work_type = ranking_work_type(ranking_type)
+        if required_work_type is not None:
+            artworks = [
+                artwork
+                for artwork in artworks
+                if _field(artwork, "type") == required_work_type
+            ]
+        artworks = filter_artworks(artworks, filters)
+        return await self._download_items(
+            artworks,
+            lambda artwork: artwork,
+            task_id=task_id,
+            start_index=start_index,
+            control=control,
+        )
+
     async def download_artwork_ids(
         self,
         artwork_ids: list[int],
@@ -787,6 +896,7 @@ class ArtistDownloader:
             "page_count": parse_page_count(artwork),
             "create_date": str(_field(artwork, "create_date", "")),
             "download_info": {
+                **self.metadata_context,
                 "source": self.source,
                 "downloaded_at": datetime.now(timezone.utc).isoformat(),
                 "file_path": str(save_path),

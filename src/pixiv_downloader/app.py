@@ -13,11 +13,12 @@ from .config_manager import ConfigManager
 from .download_policy import DownloadPolicy
 from .database import DatabaseManager
 from .downloader import ArtistDownloader
-from .file_organizer import create_search_directory
+from .file_organizer import create_ranking_directory, create_search_directory
 from .follow_latest import FollowLatestError, FollowLatestScanner
 from .filters import FilterValidationError, normalize_filters
 from .logging_setup import configure_logging
 from .proxy import ProxyConfigError, ProxyManager
+from .ranking import RankingValidationError, normalize_ranking_query
 from .runtime import runtime_paths
 from .search import SearchValidationError, normalize_search_query
 from .task_manager import TaskManager, TaskManagerError
@@ -69,6 +70,12 @@ def _execute_download_task(task, control):
             task_date = date.fromisoformat(str(task.get("created_time", ""))[:10])
         except (SearchValidationError, FilterValidationError, ValueError):
             raise TaskManagerError("搜索任务缺少有效查询") from None
+    elif task_type == "ranking":
+        try:
+            value = normalize_ranking_query(query)
+            filters = normalize_filters(task.get("filters"))
+        except (RankingValidationError, FilterValidationError):
+            raise TaskManagerError("排行榜任务缺少有效查询") from None
     elif task_type in {"follow_latest", "retry_failed"}:
         value = query.get("artwork_ids")
         if (
@@ -110,6 +117,19 @@ def _execute_download_task(task, control):
             ),
             "source": "search",
         })
+    elif task_type == "ranking":
+        downloader_options.update({
+            "collection_dir": create_ranking_directory(
+                output_dir.resolve(),
+                value["ranking_type"],
+                date.fromisoformat(value["date"]),
+            ),
+            "source": "ranking",
+            "metadata_context": {
+                "ranking_type": value["ranking_type"],
+                "ranking_date": value["date"],
+            },
+        })
     downloader = ArtistDownloader(
         auth_manager.api,
         database_manager,
@@ -132,6 +152,14 @@ def _execute_download_task(task, control):
             value["keyword"],
             value["search_type"],
             value["sort"],
+            value["limit"],
+            filters=filters,
+            **options,
+        )
+    elif task_type == "ranking":
+        operation = downloader.download_ranking(
+            value["ranking_type"],
+            value["date"],
             value["limit"],
             filters=filters,
             **options,
@@ -503,6 +531,25 @@ def create_task():
             }), 400
         task_id = task_manager.create_task(
             task_type="search",
+            query=normalized_query,
+            filters=filters,
+        )
+        return jsonify({
+            "success": True,
+            "task_id": task_id,
+            "status": "pending",
+        }), 201
+    elif task_type == "ranking":
+        try:
+            normalized_query = normalize_ranking_query(query)
+            filters = normalize_filters(data.get("filters"))
+        except (RankingValidationError, FilterValidationError):
+            return jsonify({
+                "success": False,
+                "error": "排行榜条件或筛选条件无效。",
+            }), 400
+        task_id = task_manager.create_task(
+            task_type="ranking",
             query=normalized_query,
             filters=filters,
         )

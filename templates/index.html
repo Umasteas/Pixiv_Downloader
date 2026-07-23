@@ -160,6 +160,63 @@
                 </div>
             </div>
             <div class="col-12 mt-4">
+                <div class="card">
+                    <div class="card-body">
+                        <h2 class="h4">排行榜下载</h2>
+                        <p class="text-muted">选择最近 30 天内的 Pixiv 榜单，并下载指定数量的作品。</p>
+                        <form id="ranking-download-form" class="row g-3 align-items-end">
+                            <div class="col-md-4">
+                                <label for="ranking-type" class="form-label">榜单类型</label>
+                                <select id="ranking-type" class="form-select">
+                                    <option value="daily" selected>综合日榜</option>
+                                    <option value="daily_illust">插画日榜</option>
+                                    <option value="daily_ugoira">动图日榜</option>
+                                    <option value="weekly">综合周榜</option>
+                                    <option value="monthly">综合月榜</option>
+                                    <option value="rookie">新人榜</option>
+                                    <option value="daily_manga">漫画日榜</option>
+                                    <option value="daily_r18">R-18 日榜</option>
+                                    <option value="weekly_r18">R-18 周榜</option>
+                                    <option value="weekly_r18g">R-18-G 周榜</option>
+                                </select>
+                            </div>
+                            <div class="col-md-4">
+                                <label for="ranking-date" class="form-label">榜单日期（最近 30 天）</label>
+                                <input id="ranking-date" class="form-control" type="date" required>
+                            </div>
+                            <div class="col-md-4">
+                                <label for="ranking-limit" class="form-label">数量</label>
+                                <input id="ranking-limit" class="form-control" type="number" min="1" max="500" value="500" required inputmode="numeric">
+                            </div>
+                            <fieldset class="col-md-5">
+                                <legend class="form-label fs-6">作品类型</legend>
+                                <div class="d-flex flex-wrap gap-3">
+                                    <label><input class="form-check-input" type="checkbox" name="ranking-work-types" value="illust" checked> 插画</label>
+                                    <label><input class="form-check-input" type="checkbox" name="ranking-work-types" value="manga" checked> 漫画</label>
+                                    <label><input class="form-check-input" type="checkbox" name="ranking-work-types" value="ugoira" checked> 动图</label>
+                                </div>
+                            </fieldset>
+                            <fieldset class="col-md-5">
+                                <legend class="form-label fs-6">分级</legend>
+                                <div class="d-flex flex-wrap gap-3">
+                                    <label><input class="form-check-input" type="checkbox" name="ranking-r18-modes" value="general" checked> 全年龄</label>
+                                    <label><input class="form-check-input" type="checkbox" name="ranking-r18-modes" value="r18" checked> R-18</label>
+                                    <label><input class="form-check-input" type="checkbox" name="ranking-r18-modes" value="r18g" checked> R-18-G</label>
+                                </div>
+                            </fieldset>
+                            <div class="col-md-2">
+                                <label for="ranking-min-bookmarks" class="form-label">最低收藏数</label>
+                                <input id="ranking-min-bookmarks" class="form-control" type="number" min="0" value="0" inputmode="numeric">
+                            </div>
+                            <div class="col-12">
+                                <button id="ranking-download-submit" class="btn btn-primary" type="submit">创建排行榜任务</button>
+                            </div>
+                        </form>
+                        <div id="ranking-download-feedback" class="alert mt-3 d-none" role="alert"></div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-12 mt-4">
                 <div id="task-panel" class="card">
                     <div class="card-body">
                         <div class="d-flex flex-wrap justify-content-between align-items-center gap-2">
